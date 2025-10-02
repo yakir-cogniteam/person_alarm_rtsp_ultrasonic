@@ -18,3 +18,5 @@
 # wget https://www.onvif.org/ver10/schema/common.xsd
 # cd ../../ver20/schema
 # wget https://www.onvif.org/ver20/schema/onvif.xsd
+
+pip3 install pytapo==3.3.15 python-kasa==0.5.0

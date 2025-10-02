@@ -8,6 +8,15 @@ import threading
 import numpy as np
 import os
 
+# Import pytapo for Tapo-specific alarm control
+try:
+    from pytapo import Tapo
+    PYTAPO_AVAILABLE = True
+except ImportError:
+    PYTAPO_AVAILABLE = False
+    print("⚠️  pytapo library not found. Install with: pip install pytapo")
+    print("   Alarm feature will be limited without pytapo")
+
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
@@ -76,6 +85,17 @@ class PersonAlarmManager:
         self.detection_start_time = 0
         self.detection_duration = 10.0  # 10 seconds
         
+        # Audio alarm settings
+        self.device_service = None
+        self.audio_available = False
+        self.beep_on_detection = True  # Enable/disable beep
+        self.last_beep_time = 0
+        self.beep_cooldown = 2.0  # Minimum seconds between beeps
+        
+        # Tapo-specific alarm control
+        self.tapo_controller = None
+        self.tapo_alarm_available = False
+        
         # Initialize detector if enabled
         if self.enable_detection:
             self._init_person_detector()
@@ -119,6 +139,187 @@ class PersonAlarmManager:
             print(f"❌ Failed to initialize person detector: {e}")
             print("   Person detection will be disabled")
             self.enable_detection = False
+            return False
+    
+    def _check_audio_capabilities(self):
+        """Check if camera supports audio output"""
+        try:
+            if not self.device_service:
+                self.audio_available = False
+                return
+            
+            # Try to get audio output configuration
+            audio_outputs = self.device_service.GetAudioOutputs()
+            
+            if audio_outputs:
+                print(f"✅ Audio output available: {len(audio_outputs)} output(s)")
+                self.audio_available = True
+                
+                # Print audio output details
+                for i, output in enumerate(audio_outputs):
+                    print(f"   Audio Output {i}: Token={output.token}")
+            else:
+                print("⚠️  No audio outputs found")
+                self.audio_available = False
+                
+        except Exception as e:
+            print(f"⚠️  Could not check audio capabilities: {e}")
+            self.audio_available = False
+    
+    def _init_tapo_controller(self):
+        """Initialize Tapo controller for alarm functionality"""
+        if not PYTAPO_AVAILABLE:
+            print("⚠️  Tapo controller not available (pytapo not installed)")
+            return
+        
+        try:
+            print("Initializing Tapo controller for alarm functionality...")
+            self.tapo_controller = Tapo(self.camera_ip, self.username, self.password)
+            
+            # Test if we can get basic info
+            basic_info = self.tapo_controller.getBasicInfo()
+            if basic_info:
+                print("✅ Tapo controller initialized successfully")
+                self.tapo_alarm_available = True
+                
+                # Get alarm config to verify it's supported
+                try:
+                    alarm_config = self.tapo_controller.getAlarmConfig()
+                    print(f"   Alarm feature detected: {alarm_config}")
+                except Exception as alarm_e:
+                    print(f"   Note: Could not verify alarm config: {alarm_e}")
+            else:
+                print("⚠️  Could not verify Tapo controller")
+                self.tapo_alarm_available = False
+                
+        except Exception as e:
+            print(f"⚠️  Failed to initialize Tapo controller: {e}")
+            print("   Tapo alarm feature will not be available")
+            self.tapo_alarm_available = False
+    
+    def play_tapo_alarm(self, duration=1.0):
+        """
+        Play alarm sound through Tapo camera using pytapo library
+        
+        Args:
+            duration (float): Duration of the alarm in seconds (default 1.0)
+        """
+        if not self.tapo_alarm_available or not self.tapo_controller:
+            return False
+        
+        try:
+            # Use testUsrDefAudio method which triggers the manual alarm
+            # Parameters: sound_type (1-10), enabled (True/False)
+            # Sound types: different alarm sounds
+            sound_type = "1"  # Default alarm sound
+            
+            print(f"🔊 Triggering Tapo alarm (sound type {sound_type})...")
+            
+            # Start the alarm
+            result = self.tapo_controller.testUsrDefAudio(sound_type, True)
+            
+            # Schedule alarm stop after duration
+            def stop_alarm():
+                time.sleep(duration)
+                try:
+                    self.tapo_controller.testUsrDefAudio(sound_type, False)
+                    print("   Alarm stopped")
+                except:
+                    pass
+            
+            threading.Thread(target=stop_alarm, daemon=True).start()
+            
+            return True
+            
+        except Exception as e:
+            print(f"⚠️  Failed to trigger Tapo alarm: {e}")
+            print(f"   Error details: {type(e).__name__}")
+            return False
+    
+    def play_beep(self):
+        """Play a beep sound through the camera speaker"""
+        if not self.beep_on_detection:
+            return False
+        
+        # Check cooldown to avoid spamming beeps
+        current_time = time.time()
+        if current_time - self.last_beep_time < self.beep_cooldown:
+            return False
+        
+        # Try Tapo-specific method first (best for C200)
+        if self.tapo_alarm_available:
+            success = self.play_tapo_alarm(duration=1.0)
+            if success:
+                self.last_beep_time = current_time
+                return True
+        
+        # Fallback to ONVIF methods if Tapo method fails
+        if not self.device_service or not self.audio_available:
+            return False
+        
+        try:
+            # Method 1: Try using RelayOutput (some cameras use relay for alarm)
+            try:
+                # Get relay outputs
+                relay_outputs = self.device_service.GetRelayOutputs()
+                if relay_outputs and len(relay_outputs) > 0:
+                    # Trigger the first relay output
+                    relay_token = relay_outputs[0].token
+                    
+                    # Create trigger request
+                    trigger_request = self.device_service.create_type('SetRelayOutputState')
+                    trigger_request.RelayOutputToken = relay_token
+                    trigger_request.LogicalState = 'active'
+                    
+                    self.device_service.SetRelayOutputState(trigger_request)
+                    
+                    # Deactivate after short delay (in separate thread)
+                    def deactivate_relay():
+                        time.sleep(0.3)  # 300ms beep
+                        try:
+                            trigger_request.LogicalState = 'inactive'
+                            self.device_service.SetRelayOutputState(trigger_request)
+                        except:
+                            pass
+                    
+                    threading.Thread(target=deactivate_relay, daemon=True).start()
+                    
+                    self.last_beep_time = current_time
+                    print("🔊 BEEP! (Relay triggered)")
+                    return True
+            except Exception as relay_error:
+                pass  # Try next method
+            
+            # Method 2: Try using AudioOutput configuration
+            try:
+                audio_outputs = self.device_service.GetAudioOutputs()
+                if audio_outputs and len(audio_outputs) > 0:
+                    audio_token = audio_outputs[0].token
+                    
+                    # Try to set audio output to generate a tone
+                    # Note: This method varies by camera manufacturer
+                    audio_config = self.device_service.create_type('SetAudioOutputConfiguration')
+                    audio_config.Configuration = {
+                        'token': audio_token,
+                        'OutputLevel': 80  # Volume level (0-100)
+                    }
+                    
+                    self.device_service.SetAudioOutputConfiguration(audio_config)
+                    
+                    self.last_beep_time = current_time
+                    print("🔊 BEEP! (Audio output triggered)")
+                    return True
+            except Exception as audio_error:
+                pass  # Try next method
+            
+            # Method 3: Try using System Reboot command as alarm (not recommended but works on some cameras)
+            # We'll skip this as it could disrupt operation
+            
+            print("⚠️  Could not trigger beep - camera may not support audio alarm via ONVIF")
+            return False
+            
+        except Exception as e:
+            print(f"⚠️  Failed to play beep: {e}")
             return False
     
     def activate_detection(self):
@@ -269,6 +470,20 @@ class PersonAlarmManager:
                 print("Imaging service initialized successfully")
             except Exception as e:
                 print(f"Warning: Imaging service not available: {e}")
+            
+            # Get device management service for audio alarm
+            try:
+                self.device_service = self.camera.create_devicemgmt_service()
+                print("Device management service initialized successfully")
+                
+                # Check if audio output is available
+                self._check_audio_capabilities()
+            except Exception as e:
+                print(f"Warning: Device management service not available: {e}")
+                self.device_service = None
+            
+            # Initialize Tapo controller for alarm
+            self._init_tapo_controller()
             
             # Get stream URL (prioritize stream2 for lower latency)
             self._get_stream_url()
@@ -592,7 +807,16 @@ class PersonAlarmManager:
         print(f"  Tilt step: {self.tilt_step}, Tilt speed: {self.tilt_speed}")
         print("  SPACE: Activate person detection for 10 seconds")
         print("  'd': Toggle detection display")
+        print("  'b': Toggle beep on/off")
         print("  'q': Quit")
+        beep_status = "ON" if self.beep_on_detection else "OFF"
+        if self.tapo_alarm_available:
+            audio_status = "AVAILABLE (Tapo API)"
+        elif self.audio_available:
+            audio_status = "AVAILABLE (ONVIF)"
+        else:
+            audio_status = "NOT AVAILABLE"
+        print(f"Audio Beep: {beep_status} (Hardware: {audio_status})")
         print("=" * 50)
         
         self.running = True
@@ -658,6 +882,9 @@ class PersonAlarmManager:
                         self.detection_count += 1
                         self.last_detection_time = current_time
                         print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
+                        
+                        # ADDED: Play beep when person is detected
+                        self.play_beep()
                 else:
                     if self.person_detected:
                         print(f"✅ Person left the frame")
@@ -727,6 +954,10 @@ class PersonAlarmManager:
                     self.activate_detection()
                 else:
                     print("⚠️  Person detection is disabled")
+            elif key == ord('b'):  # ADDED: Toggle beep
+                self.beep_on_detection = not self.beep_on_detection
+                status = "ON" if self.beep_on_detection else "OFF"
+                print(f"🔊 Beep on detection: {status}")
             elif key != 255:  # 255 means no key was pressed
                 # Handle arrow keys (non-blocking)
                 self._handle_arrow_keys(key)
@@ -784,8 +1015,8 @@ def main():
     ENABLE_DETECTION = True      # Set to False to disable person detection
     DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
     
-    print("🎥 Person Alarm Manager - Tapo C200 (Space-Activated Detection)")
-    print("=" * 50)
+    print("🎥 Person Alarm Manager - Tapo C200 (Space-Activated Detection + Alarm)")
+    print("=" * 70)
     print(f"Camera IP: {CAMERA_IP}")
     print(f"Username: {USERNAME}")
     print(f"Password: {'*' * len(PASSWORD)}")
@@ -794,6 +1025,12 @@ def main():
     print(f"Person Detection: {'ENABLED (Press SPACE to activate)' if ENABLE_DETECTION else 'DISABLED'}")
     print(f"Detection Confidence: {DETECTION_CONFIDENCE}")
     print(f"Detection Duration: 10 seconds")
+    
+    if not PYTAPO_AVAILABLE:
+        print("\n⚠️  WARNING: pytapo library not installed!")
+        print("   Install it with: pip install pytapo")
+        print("   Without pytapo, alarm feature may not work properly on Tapo C200")
+    
     print()
     
     # Create manager instance
