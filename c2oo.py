@@ -1,46 +1,28 @@
 #!/usr/bin/env python3
 
-# sudo apt install python3-opencv
-# pip3 install onvif-zeep --break-system-packages
-# cd /home/pi/.local/lib/python3.11/site-packages/wsdl/
-# cd /home/pi/.local/lib/python3.11/site-packages/wsdl
-# cd /home/pi/.local/lib/python3.11/site-packages/
-# mkdir -p wsdl
-# cd wsdl/
-# wget https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl
-# wget https://www.onvif.org/ver10/media/wsdl/media.wsdl
-# wget https://www.onvif.org/ver20/ptz/wsdl/ptz.wsdl
-# wget https://www.onvif.org/ver10/events/wsdl/event.wsdl
-# wget https://www.onvif.org/ver20/imaging/wsdl/imaging.wsdl
-
-# cd /home/pi/.local/lib/
-# mkdir -p ver10/schema
-# mkdir -p ver20/schema
-# wget https://www.onvif.org/ver10/schema/onvif.xsd
-# wget https://www.onvif.org/ver10/schema/common.xsd
-# cd ../../ver20/schema
-# wget https://www.onvif.org/ver20/schema/onvif.xsd
-
-
 import cv2
 import time
 from onvif import ONVIFCamera
 from zeep import wsse
 import threading
 import numpy as np
-import requests
-from urllib.parse import urlparse
 
-class TapoC200Controller:
-    def __init__(self, camera_ip, username, password, port=2020):
+
+class PersonAlarmManager:
+    def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
+                 pan_speed=0.5, tilt_speed=0.5):
         """
-        Initialize Tapo C200 camera connection
+        Initialize Person Alarm Manager for Tapo C200 camera
         
         Args:
             camera_ip (str): IP address of the camera
-            username (str): Camera username (usually 'admin')
+            username (str): Camera username
             password (str): Camera password
             port (int): ONVIF port (default 2020 for Tapo cameras)
+            pan_step (float): Step size for pan adjustment (default 0.1)
+            tilt_step (float): Step size for tilt adjustment (default 0.1)
+            pan_speed (float): Pan movement speed in range [0.0, 1.0] (default 0.5)
+            tilt_speed (float): Tilt movement speed in range [0.0, 1.0] (default 0.5)
         """
         self.camera_ip = camera_ip
         self.username = username
@@ -52,6 +34,31 @@ class TapoC200Controller:
         self.imaging_service = None
         self.stream_url = None
         self.video_capture = None
+        self.running = False
+        
+        # Step sizes for arrow key adjustments
+        self.pan_step = pan_step
+        self.tilt_step = tilt_step
+        
+        # Speed settings for absolute moves
+        self.pan_speed = pan_speed
+        self.tilt_speed = tilt_speed
+        
+        # Current camera position
+        self.current_pan = 0.0
+        self.current_tilt = 0.0
+        
+        # Thread lock for PTZ commands
+        self.ptz_lock = threading.Lock()
+        
+        # Track pending PTZ commands
+        self.ptz_thread = None
+        
+        # Frame threading for reduced latency
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.capture_thread = None
+        self.frame_available = threading.Event()
         
     def connect(self):
         """Connect to the camera and initialize services"""
@@ -78,8 +85,11 @@ class TapoC200Controller:
             except Exception as e:
                 print(f"Warning: Imaging service not available: {e}")
             
-            # Get stream URL
+            # Get stream URL (prioritize stream2 for lower latency)
             self._get_stream_url()
+            
+            # Initialize video capture with low-latency settings
+            self._init_video_capture()
             
             print("Successfully connected to Tapo C200")
             return True
@@ -89,13 +99,13 @@ class TapoC200Controller:
             return False
     
     def _get_stream_url(self):
-        """Get the RTSP stream URL with multiple fallback options"""
-        # Based on the test results, we know these URLs work:
+        """Get the RTSP stream URL with priority on low-latency stream2"""
+        # Prioritize stream2 (lower resolution, lower latency)
         working_urls = [
-            f"rtsp://{self.username}:{self.password}@{self.camera_ip}:554/stream1",  # High quality
-            f"rtsp://{self.username}:{self.password}@{self.camera_ip}:554/stream2",  # Lower quality
-            f"rtsp://{self.username}:{self.password}@{self.camera_ip}/stream1",
-            f"rtsp://{self.username}:{self.password}@{self.camera_ip}/stream2"
+            f"rtsp://{self.username}:{self.password}@{self.camera_ip}:554/stream2",  # Lower latency
+            f"rtsp://{self.username}:{self.password}@{self.camera_ip}:554/stream1",
+            f"rtsp://{self.username}:{self.password}@{self.camera_ip}/stream2",
+            f"rtsp://{self.username}:{self.password}@{self.camera_ip}/stream1"
         ]
         
         try:
@@ -103,6 +113,10 @@ class TapoC200Controller:
             profiles = self.media_service.GetProfiles()
             
             if profiles:
+                # Try to find a lower resolution profile for lower latency
+                for profile in profiles:
+                    print(f"Available profile: {profile.Name}")
+                
                 profile = profiles[0]
                 print(f"Using profile: {profile.Name}")
                 
@@ -117,7 +131,6 @@ class TapoC200Controller:
                 onvif_url = stream_uri.Uri
                 print(f"ONVIF Stream URL: {onvif_url}")
                 
-                # Test if ONVIF URL works
                 if self._test_rtsp_url(onvif_url):
                     self.stream_url = onvif_url
                     print("Using ONVIF provided stream URL")
@@ -126,8 +139,8 @@ class TapoC200Controller:
         except Exception as e:
             print(f"ONVIF stream URL failed: {e}")
         
-        # Use the known working URLs
-        print("Using tested working RTSP URL format...")
+        # Use the known working URLs (prioritizing stream2)
+        print("Using tested working RTSP URL format (prioritizing stream2 for lower latency)...")
         for url in working_urls:
             print(f"Testing: {url}")
             if self._test_rtsp_url(url):
@@ -135,28 +148,16 @@ class TapoC200Controller:
                 print(f"Selected working stream URL: {url}")
                 return
         
-        # Fallback to first known working format
+        # Fallback to stream2 (lower latency)
         self.stream_url = working_urls[0]
         print(f"Using fallback stream URL: {self.stream_url}")
     
     def _test_rtsp_url(self, url):
         """Test if an RTSP URL is accessible"""
         try:
-            # Quick test with OpenCV
-            test_cap = cv2.VideoCapture(url)
-            
-            # Try to set timeout if available (newer OpenCV versions)
-            try:
-                test_cap.set(cv2.CAP_PROP_TIMEOUT, 5000)  # 5 second timeout
-            except AttributeError:
-                # Older OpenCV versions don't have CAP_PROP_TIMEOUT
-                pass
+            test_cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             
             if test_cap.isOpened():
-                # Use a simple timeout mechanism for older OpenCV
-                import threading
-                import time
-                
                 result = [False, None]
                 
                 def read_frame():
@@ -167,12 +168,11 @@ class TapoC200Controller:
                 thread = threading.Thread(target=read_frame)
                 thread.daemon = True
                 thread.start()
-                thread.join(timeout=3)  # 3 second timeout
+                thread.join(timeout=3)
                 
                 test_cap.release()
                 
                 if thread.is_alive():
-                    print(f"Timeout testing URL: {url}")
                     return False
                 
                 return result[0] and result[1] is not None
@@ -184,24 +184,24 @@ class TapoC200Controller:
             print(f"URL test failed: {e}")
             return False
     
-    def start_video_stream(self):
-        """Start video streaming with enhanced error handling"""
+    def _init_video_capture(self):
+        """Initialize video capture with low-latency settings"""
         try:
-            print("Starting video stream...")
+            print("Initializing video stream with low-latency settings...")
             print(f"Stream URL: {self.stream_url}")
             
-            # Create video capture object
-            self.video_capture = cv2.VideoCapture(self.stream_url)
+            self.video_capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
             
-            if not self.video_capture.isOpened():
-                print("Failed to open video capture, trying with CAP_FFMPEG backend...")
-                self.video_capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+            # Critical: Set buffer size to 1 to minimize latency
+            self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Set additional low-latency properties
+            self.video_capture.set(cv2.CAP_PROP_FPS, 30)
             
             if self.video_capture.isOpened():
-                # Test reading a frame
                 ret, frame = self.video_capture.read()
                 if ret and frame is not None:
-                    print(f"✅ Video stream started successfully!")
+                    print(f"✅ Video stream initialized successfully!")
                     print(f"Frame size: {frame.shape}")
                     return True
                 else:
@@ -212,43 +212,231 @@ class TapoC200Controller:
                 return False
             
         except Exception as e:
-            print(f"Failed to start video stream: {e}")
+            print(f"Failed to initialize video stream: {e}")
             return False
     
-    def show_video(self):
-        """Display video stream in a window with PTZ controls"""
-        if not self.video_capture:
-            print("Video stream not started")
+    def _frame_capture_thread(self):
+        """Continuously capture frames in background thread to avoid buffering"""
+        print("Frame capture thread started")
+        consecutive_failures = 0
+        max_failures = 30
+        
+        while self.running:
+            ret, frame = self.video_capture.read()
+            
+            if ret and frame is not None:
+                consecutive_failures = 0
+                with self.frame_lock:
+                    self.latest_frame = frame
+                self.frame_available.set()
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    print(f"❌ Frame capture failed {consecutive_failures} times, stopping...")
+                    self.running = False
+                    break
+                time.sleep(0.01)  # Brief pause on failure
+        
+        print("Frame capture thread stopped")
+    
+    def abs_pan(self, pan_position, speed=None):
+        """
+        Send absolute pan command to the camera with speed
+        
+        Args:
+            pan_position (float): Pan position in range [-1.0, 1.0]
+                                 -1.0 = full left, 0.0 = center, 1.0 = full right
+            speed (float): Pan speed in range [0.0, 1.0]. If None, uses self.pan_speed
+        """
+        if not self.ptz_service:
+            print("PTZ service not available")
+            return False
+        
+        try:
+            # Clamp the value to valid range
+            pan_position = max(-1.0, min(1.0, pan_position))
+            
+            # Use provided speed or default
+            if speed is None:
+                speed = self.pan_speed
+            speed = max(0.0, min(1.0, speed))
+            
+            profiles = self.media_service.GetProfiles()
+            profile = profiles[0]
+            
+            request = self.ptz_service.create_type('AbsoluteMove')
+            request.ProfileToken = profile.token
+            request.Position = {
+                'PanTilt': {'x': pan_position, 'y': self.current_tilt},
+                'Zoom': {'x': 0.0}
+            }
+            # Set the speed for the movement
+            request.Speed = {
+                'PanTilt': {'x': speed, 'y': speed},
+                'Zoom': 0.0
+            }
+            
+            self.ptz_service.AbsoluteMove(request)
+            self.current_pan = pan_position
+            print(f"Absolute pan to position: {pan_position:.2f} at speed: {speed:.2f}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to execute absolute pan: {e}")
+            return False
+    
+    def abs_tilt(self, tilt_position, speed=None):
+        """
+        Send absolute tilt command to the camera with speed
+        
+        Args:
+            tilt_position (float): Tilt position in range [-1.0, 1.0]
+                                  -1.0 = full down, 0.0 = center, 1.0 = full up
+            speed (float): Tilt speed in range [0.0, 1.0]. If None, uses self.tilt_speed
+        """
+        if not self.ptz_service:
+            print("PTZ service not available")
+            return False
+        
+        try:
+            # Clamp the value to valid range
+            tilt_position = max(-1.0, min(1.0, tilt_position))
+            
+            # Use provided speed or default
+            if speed is None:
+                speed = self.tilt_speed
+            speed = max(0.0, min(1.0, speed))
+            
+            profiles = self.media_service.GetProfiles()
+            profile = profiles[0]
+            
+            request = self.ptz_service.create_type('AbsoluteMove')
+            request.ProfileToken = profile.token
+            request.Position = {
+                'PanTilt': {'x': self.current_pan, 'y': tilt_position},
+                'Zoom': {'x': 0.0}
+            }
+            # Set the speed for the movement
+            request.Speed = {
+                'PanTilt': {'x': speed, 'y': speed},
+                'Zoom': 0.0
+            }
+            
+            self.ptz_service.AbsoluteMove(request)
+            self.current_tilt = tilt_position
+            print(f"Absolute tilt to position: {tilt_position:.2f} at speed: {speed:.2f}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to execute absolute tilt: {e}")
+            return False
+    
+    def _execute_ptz_move(self, direction):
+        """
+        Execute PTZ move in a separate thread
+        
+        Args:
+            direction (str): 'left', 'right', 'up', or 'down'
+        """
+        with self.ptz_lock:
+            if direction == 'left':
+                new_pan = self.current_pan - self.pan_step
+                self.abs_pan(new_pan)
+            elif direction == 'right':
+                new_pan = self.current_pan + self.pan_step
+                self.abs_pan(new_pan)
+            elif direction == 'up':
+                new_tilt = self.current_tilt + self.tilt_step
+                self.abs_tilt(new_tilt)
+            elif direction == 'down':
+                new_tilt = self.current_tilt - self.tilt_step
+                self.abs_tilt(new_tilt)
+    
+    def _handle_arrow_keys(self, key):
+        """
+        Handle arrow key presses for camera control
+        
+        Args:
+            key: The key code from cv2.waitKey()
+        """
+        direction = None
+        
+        if key == 81 or key == 2:  # Left arrow
+            direction = 'left'
+            print(f"⬅️  Left arrow: pan {self.current_pan:.2f} -> {self.current_pan - self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
+            
+        elif key == 83 or key == 3:  # Right arrow
+            direction = 'right'
+            print(f"➡️  Right arrow: pan {self.current_pan:.2f} -> {self.current_pan + self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
+            
+        elif key == 82 or key == 0:  # Up arrow
+            direction = 'up'
+            print(f"⬆️  Up arrow: tilt {self.current_tilt:.2f} -> {self.current_tilt + self.tilt_step:.2f} (speed: {self.tilt_speed:.2f})")
+            
+        elif key == 84 or key == 1:  # Down arrow
+            direction = 'down'
+            print(f"⬇️  Down arrow: tilt {self.current_tilt:.2f} -> {self.current_tilt - self.tilt_step:.2f} (speed: {self.tilt_speed:.2f})")
+        
+        # Execute PTZ move in separate thread (non-blocking)
+        if direction:
+            if self.ptz_thread is None or not self.ptz_thread.is_alive():
+                self.ptz_thread = threading.Thread(
+                    target=self._execute_ptz_move,
+                    args=(direction,)
+                )
+                self.ptz_thread.daemon = True
+                self.ptz_thread.start()
+    
+    def run(self):
+        """
+        Main run loop - runs at 10Hz and displays video stream
+        Press 'q' to quit
+        """
+        if not self.video_capture or not self.video_capture.isOpened():
+            print("Video capture not initialized")
             return
         
-        print("\n🎥 Starting video display...")
+        print("\n🎥 Starting Person Alarm Manager (Low-Latency Mode)...")
         print("=" * 50)
+        print("Running at 10 Hz with background frame capture")
         print("Controls:")
-        print("  W/S: Tilt up/down")
-        print("  A/D: Pan left/right") 
-        print("  R: Reset to home position")
-        print("  I: Show camera info")
-        print("  Q: Quit")
-        print("  SPACE: Take snapshot")
+        print("  Arrow Keys: Pan/Tilt camera (absolute positioning with speed)")
+        print(f"  Pan step: {self.pan_step}, Pan speed: {self.pan_speed}")
+        print(f"  Tilt step: {self.tilt_step}, Tilt speed: {self.tilt_speed}")
+        print("  'q': Quit")
         print("=" * 50)
+        
+        self.running = True
+        
+        # Start background frame capture thread
+        self.capture_thread = threading.Thread(target=self._frame_capture_thread)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+        
+        target_hz = 10
+        target_interval = 1.0 / target_hz  # 0.1 seconds for 10 Hz
         
         frame_count = 0
         fps_start_time = time.time()
         fps_counter = 0
+        fps = 0
         
-        while True:
-            ret, frame = self.video_capture.read()
+        # Wait for first frame
+        if not self.frame_available.wait(timeout=5.0):
+            print("❌ Timeout waiting for first frame")
+            self.running = False
+            return
+        
+        while self.running:
+            loop_start_time = time.time()
             
-            if not ret:
-                print(f"❌ Failed to read frame {frame_count}")
-                frame_count += 1
-                if frame_count > 5:
-                    print("Too many failed frames, exiting...")
-                    break
-                time.sleep(0.1)
-                continue
+            # Get latest frame from background thread
+            with self.frame_lock:
+                if self.latest_frame is None:
+                    time.sleep(0.001)
+                    continue
+                frame = self.latest_frame.copy()
             
-            frame_count = 0  # Reset counter on successful frame
             fps_counter += 1
             
             # Calculate FPS every second
@@ -257,8 +445,6 @@ class TapoC200Controller:
                 fps = fps_counter / (current_time - fps_start_time)
                 fps_start_time = current_time
                 fps_counter = 0
-            else:
-                fps = 0
             
             # Add overlay information
             height, width = frame.shape[:2]
@@ -274,289 +460,97 @@ class TapoC200Controller:
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             
-            # Add resolution info
-            res_text = f"{width}x{height}"
-            cv2.putText(frame, res_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame, res_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            # Add resolution and loop rate info
+            info_text = f"{width}x{height} @ {target_hz}Hz (Low-Latency)"
+            cv2.putText(frame, info_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, info_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             
-            # Add control instructions
-            controls_text = "WASD: Pan/Tilt | R: Home | SPACE: Snapshot | Q: Quit"
-            text_size = cv2.getTextSize(controls_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-            cv2.putText(frame, controls_text, (width - text_size[0] - 10, height - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            cv2.putText(frame, controls_text, (width - text_size[0] - 10, height - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            # Add PTZ position and speed info
+            ptz_text = f"Pan: {self.current_pan:.2f} (speed: {self.pan_speed:.2f}) | Tilt: {self.current_tilt:.2f} (speed: {self.tilt_speed:.2f})"
+            cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            # Display the frame
-            cv2.imshow('Tapo C200 Live Stream', frame)
+            # Show the frame
+            cv2.imshow('Person Alarm Manager', frame)
             
-            # Handle key presses
+            # Reduced waitKey for faster response (1ms instead of 30ms)
             key = cv2.waitKey(1) & 0xFF
             
-            if key == ord('q') or key == ord('Q'):
-                print("👋 Quitting...")
-                break
-            elif key == ord('w') or key == ord('W'):
-                print("⬆️  Tilting up...")
-                self.tilt_up()
-            elif key == ord('s') or key == ord('S'):
-                print("⬇️  Tilting down...")
-                self.tilt_down()
-            elif key == ord('a') or key == ord('A'):
-                print("⬅️  Panning left...")
-                self.pan_left()
-            elif key == ord('d') or key == ord('D'):
-                print("➡️  Panning right...")
-                self.pan_right()
-            elif key == ord('r') or key == ord('R'):
-                print("🏠 Going to home position...")
-                self.go_home()
-            elif key == ord('i') or key == ord('I'):
-                print("ℹ️  Getting camera info...")
-                self.get_camera_info()
-            elif key == ord(' '):  # Space bar
-                print("📸 Taking snapshot...")
-                self.save_snapshot()
+            if key != 255:  # 255 means no key was pressed
+                # Handle arrow keys (non-blocking)
+                self._handle_arrow_keys(key)
+            
+            # Calculate sleep time to maintain 10 Hz
+            loop_elapsed = time.time() - loop_start_time
+            sleep_time = target_interval - loop_elapsed
+            
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # If we're running slower than 10 Hz, print a warning occasionally
+                if frame_count % 100 == 0:
+                    print(f"⚠️ Warning: Loop running slower than {target_hz} Hz")
+            
+            frame_count += 1
         
         cv2.destroyAllWindows()
-    
-    def pan_left(self, speed=0.5):
-        """Pan camera left"""
-        if not self.ptz_service:
-            print("PTZ service not available")
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('ContinuousMove')
-            request.ProfileToken = profile.token
-            request.Velocity = {
-                'PanTilt': {'x': -speed, 'y': 0.0},
-                'Zoom': {'x': 0.0}
-            }
-            
-            self.ptz_service.ContinuousMove(request)
-            print("Panning left...")
-            
-            time.sleep(0.5)
-            self.stop_ptz()
-            
-        except Exception as e:
-            print(f"Failed to pan left: {e}")
-    
-    def pan_right(self, speed=0.5):
-        """Pan camera right"""
-        if not self.ptz_service:
-            print("PTZ service not available")
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('ContinuousMove')
-            request.ProfileToken = profile.token
-            request.Velocity = {
-                'PanTilt': {'x': speed, 'y': 0.0},
-                'Zoom': {'x': 0.0}
-            }
-            
-            self.ptz_service.ContinuousMove(request)
-            print("Panning right...")
-            
-            time.sleep(0.5)
-            self.stop_ptz()
-            
-        except Exception as e:
-            print(f"Failed to pan right: {e}")
-    
-    def tilt_up(self, speed=0.5):
-        """Tilt camera up"""
-        if not self.ptz_service:
-            print("PTZ service not available")
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('ContinuousMove')
-            request.ProfileToken = profile.token
-            request.Velocity = {
-                'PanTilt': {'x': 0.0, 'y': speed},
-                'Zoom': {'x': 0.0}
-            }
-            
-            self.ptz_service.ContinuousMove(request)
-            print("Tilting up...")
-            
-            time.sleep(0.5)
-            self.stop_ptz()
-            
-        except Exception as e:
-            print(f"Failed to tilt up: {e}")
-    
-    def tilt_down(self, speed=0.5):
-        """Tilt camera down"""
-        if not self.ptz_service:
-            print("PTZ service not available")
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('ContinuousMove')
-            request.ProfileToken = profile.token
-            request.Velocity = {
-                'PanTilt': {'x': 0.0, 'y': -speed},
-                'Zoom': {'x': 0.0}
-            }
-            
-            self.ptz_service.ContinuousMove(request)
-            print("Tilting down...")
-            
-            time.sleep(0.5)
-            self.stop_ptz()
-            
-        except Exception as e:
-            print(f"Failed to tilt down: {e}")
-    
-    def stop_ptz(self):
-        """Stop PTZ movement"""
-        if not self.ptz_service:
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('Stop')
-            request.ProfileToken = profile.token
-            request.PanTilt = True
-            request.Zoom = True
-            
-            self.ptz_service.Stop(request)
-            
-        except Exception as e:
-            print(f"Failed to stop PTZ: {e}")
-    
-    def go_home(self):
-        """Move camera to home position"""
-        if not self.ptz_service:
-            print("PTZ service not available")
-            return
-        
-        try:
-            profiles = self.media_service.GetProfiles()
-            profile = profiles[0]
-            
-            request = self.ptz_service.create_type('GotoHomePosition')
-            request.ProfileToken = profile.token
-            
-            self.ptz_service.GotoHomePosition(request)
-            print("Moving to home position...")
-            
-        except Exception as e:
-            print(f"Failed to go home: {e}")
-    
-    def get_camera_info(self):
-        """Get comprehensive camera information"""
-        try:
-            device_service = self.camera.create_devicemgmt_service()
-            device_info = device_service.GetDeviceInformation()
-            
-            print("\n=== Camera Information ===")
-            print(f"Manufacturer: {device_info.Manufacturer}")
-            print(f"Model: {device_info.Model}")
-            print(f"Firmware Version: {device_info.FirmwareVersion}")
-            print(f"Serial Number: {device_info.SerialNumber}")
-            print(f"Hardware ID: {device_info.HardwareId}")
-            print(f"Stream URL: {self.stream_url}")
-            
-            # Get network interfaces
-            try:
-                interfaces = device_service.GetNetworkInterfaces()
-                print(f"\n=== Network Information ===")
-                for interface in interfaces:
-                    print(f"Interface: {interface.token}")
-                    if hasattr(interface.Info, 'Name'):
-                        print(f"  Name: {interface.Info.Name}")
-                    if hasattr(interface, 'IPv4') and interface.IPv4:
-                        for ipv4 in interface.IPv4.Config.Manual:
-                            print(f"  IP: {ipv4.Address}")
-            except Exception as e:
-                print(f"Network info unavailable: {e}")
-            
-            # Get PTZ capabilities
-            if self.ptz_service:
-                try:
-                    profiles = self.media_service.GetProfiles()
-                    profile = profiles[0]
-                    
-                    print(f"\n=== PTZ Information ===")
-                    print(f"PTZ Available: Yes")
-                    print(f"Profile Token: {profile.token}")
-                    
-                    # Get PTZ configuration
-                    ptz_config = self.ptz_service.GetConfiguration(profile.PTZConfiguration.token)
-                    print(f"PTZ Node Token: {ptz_config.NodeToken}")
-                    
-                except Exception as e:
-                    print(f"PTZ detailed info unavailable: {e}")
-            else:
-                print(f"\n=== PTZ Information ===")
-                print("PTZ Available: No")
-            
-        except Exception as e:
-            print(f"Failed to get camera info: {e}")
-    
-    def save_snapshot(self, filename=None):
-        """Save a snapshot from the video stream"""
-        if not self.video_capture:
-            print("Video stream not available")
-            return False
-        
-        ret, frame = self.video_capture.read()
-        if ret:
-            if not filename:
-                filename = f"tapo_snapshot_{int(time.time())}.jpg"
-            cv2.imwrite(filename, frame)
-            print(f"Snapshot saved as {filename}")
-            return True
-        else:
-            print("Failed to capture snapshot")
-            return False
+        print("Run loop stopped")
     
     def disconnect(self):
         """Clean up and disconnect"""
+        self.running = False
+        
+        # Wait for capture thread to stop
+        if self.capture_thread and self.capture_thread.is_alive():
+            print("Waiting for capture thread to stop...")
+            self.capture_thread.join(timeout=2.0)
+        
+        # Wait for any pending PTZ commands to complete
+        if self.ptz_thread and self.ptz_thread.is_alive():
+            print("Waiting for PTZ command to complete...")
+            self.ptz_thread.join(timeout=2.0)
+        
         if self.video_capture:
             self.video_capture.release()
+        
         cv2.destroyAllWindows()
         print("Disconnected from camera")
 
+
 def main():
     # Camera configuration - Update these values
-    CAMERA_IP = "192.168.1.143"  # Your camera's IP
-    USERNAME = "admin123"        # Your camera username  
-    PASSWORD = "admin123"        # Your camera password
+    CAMERA_IP = "192.168.1.143"
+    USERNAME = "admin123"
+    PASSWORD = "admin123"
     
-    print("🎥 TP-Link Tapo C200 ONVIF Controller")
+    # Absolute positioning settings with speed control
+    PAN_STEP = 0.1    # Step size for each arrow key press
+    TILT_STEP = 0.1   # Step size for each arrow key press
+    PAN_SPEED = 0.5   # Speed of movement (0.0 to 1.0) - higher is faster
+    TILT_SPEED = 0.5  # Speed of movement (0.0 to 1.0) - higher is faster
+    
+    print("🎥 Person Alarm Manager - Tapo C200 (Low-Latency)")
     print("=" * 50)
     print(f"Camera IP: {CAMERA_IP}")
     print(f"Username: {USERNAME}")
     print(f"Password: {'*' * len(PASSWORD)}")
+    print(f"Pan Step: {PAN_STEP}, Pan Speed: {PAN_SPEED}")
+    print(f"Tilt Step: {TILT_STEP}, Tilt Speed: {TILT_SPEED}")
     print()
     
-    # Create controller instance
-    controller = TapoC200Controller(CAMERA_IP, USERNAME, PASSWORD)
+    # Create manager instance
+    manager = PersonAlarmManager(
+        CAMERA_IP, USERNAME, PASSWORD,
+        pan_step=PAN_STEP,
+        tilt_step=TILT_STEP,
+        pan_speed=PAN_SPEED,
+        tilt_speed=TILT_SPEED
+    ) 
     
     try:
         # Connect to camera
         print("🔗 Connecting to camera...")
-        if not controller.connect():
+        if not manager.connect():
             print("\n❌ Failed to connect to camera. Please check:")
             print("1. Camera IP address is correct")
             print("2. Camera is powered on and connected to network")
@@ -566,68 +560,9 @@ def main():
         
         print("✅ Successfully connected!")
         
-        # Get camera information
-        controller.get_camera_info()
-        
-        # Start video stream
-        print("\n📡 Starting video stream...")
-        if not controller.start_video_stream():
-            print("\n❌ Video stream failed, testing PTZ controls only...")
-            
-            # Test PTZ controls without video
-            print("\nTesting PTZ controls (no video display):")
-            print("Testing pan left...")
-            controller.pan_left()
-            time.sleep(1)
-            
-            print("Testing pan right...")
-            controller.pan_right() 
-            time.sleep(1)
-            
-            print("Testing tilt up...")
-            controller.tilt_up()
-            time.sleep(1)
-            
-            print("Testing tilt down...")
-            controller.tilt_down()
-            time.sleep(1)
-            
-            print("Returning to home position...")
-            controller.go_home()
-            
-            return
-        else:
-            print("✅ Video stream started successfully!")
-            
-            # Test PTZ controls first
-            print("\n🎮 Testing PTZ controls...")
-            time.sleep(2)
-            
-            print("Testing pan left...")
-            controller.pan_left(speed=0.3)
-            time.sleep(2)
-            
-            print("Testing pan right...")
-            controller.pan_right(speed=0.3)
-            time.sleep(2)
-            
-            print("Testing tilt up...")
-            controller.tilt_up(speed=0.3)
-            time.sleep(2)
-            
-            print("Testing tilt down...")
-            controller.tilt_down(speed=0.3)
-            time.sleep(2)
-            
-            print("Returning to home position...")
-            controller.go_home()
-            time.sleep(3)
-            
-            print("✅ PTZ test completed!")
-            
-            # Show video with controls
-            print("\n🎥 Starting video display with live controls...")
-            controller.show_video()
+        # Start the main run loop
+        print("\n▶️ Starting main run loop...")
+        manager.run()
         
     except KeyboardInterrupt:
         print("\n⏹️  Interrupted by user")
@@ -635,8 +570,9 @@ def main():
     finally:
         # Clean up
         print("🧹 Cleaning up...")
-        controller.disconnect()
+        manager.disconnect()
         print("👋 Goodbye!")
+
 
 if __name__ == "__main__":
     main()
