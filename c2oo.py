@@ -6,11 +6,12 @@ from onvif import ONVIFCamera
 from zeep import wsse
 import threading
 import numpy as np
+import os
 
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
-                 pan_speed=0.5, tilt_speed=0.5):
+                 pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.5):
         """
         Initialize Person Alarm Manager for Tapo C200 camera
         
@@ -23,6 +24,8 @@ class PersonAlarmManager:
             tilt_step (float): Step size for tilt adjustment (default 0.1)
             pan_speed (float): Pan movement speed in range [0.0, 1.0] (default 0.5)
             tilt_speed (float): Tilt movement speed in range [0.0, 1.0] (default 0.5)
+            enable_detection (bool): Enable person detection (default True)
+            detection_confidence (float): Minimum confidence for detection (default 0.5)
         """
         self.camera_ip = camera_ip
         self.username = username
@@ -59,6 +62,152 @@ class PersonAlarmManager:
         self.frame_lock = threading.Lock()
         self.capture_thread = None
         self.frame_available = threading.Event()
+        
+        # Person detection settings
+        self.enable_detection = enable_detection
+        self.detection_confidence = detection_confidence
+        self.net = None
+        self.person_detected = False
+        self.detection_count = 0
+        self.last_detection_time = 0
+        
+        # Initialize detector if enabled
+        if self.enable_detection:
+            self._init_person_detector()
+    
+    def _init_person_detector(self):
+        """Initialize MobileNet SSD person detector (optimized for Raspberry Pi)"""
+        try:
+            print("Initializing person detector (MobileNet SSD)...")
+            
+            # Paths for the model files
+            prototxt_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
+            model_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
+            
+            # Check if model files exist
+            if not os.path.exists(prototxt_path) or not os.path.exists(model_path):
+                print("\n" + "="*60)
+                print("⚠️  MODEL FILES NOT FOUND!")
+                print("="*60)
+                print("Please download the MobileNet SSD model files:")
+                print("\n1. Download prototxt file:")
+                print("   wget https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt")
+                print("\n2. Download caffemodel file:")
+                print("   wget https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel")
+                print("\nOr use the script in the repository to download them automatically.")
+                print("="*60)
+                self.enable_detection = False
+                return False
+            
+            # Load the MobileNet SSD model
+            self.net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
+            
+            # Set backend to OpenCV for better Raspberry Pi compatibility
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            
+            print("✅ Person detector initialized successfully")
+            print(f"   Detection confidence threshold: {self.detection_confidence}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize person detector: {e}")
+            print("   Person detection will be disabled")
+            self.enable_detection = False
+            return False
+    
+    def _detect_persons(self, frame):
+        """
+        Detect persons in frame using MobileNet SSD
+        
+        Args:
+            frame: Input frame (BGR image)
+            
+        Returns:
+            detections: List of (confidence, x1, y1, x2, y2) tuples for detected persons
+        """
+        if not self.enable_detection or self.net is None:
+            return []
+        
+        try:
+            h, w = frame.shape[:2]
+            
+            # Resize for faster processing on Raspberry Pi
+            # Use smaller input size for better performance
+            blob = cv2.dnn.blobFromImage(
+                cv2.resize(frame, (300, 300)),
+                0.007843,  # Scale factor
+                (300, 300),
+                127.5  # Mean subtraction
+            )
+            
+            self.net.setInput(blob)
+            detections = self.net.forward()
+            
+            persons = []
+            
+            # MobileNet SSD class IDs: 15 = person
+            PERSON_CLASS_ID = 15
+            
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                class_id = int(detections[0, 0, i, 1])
+                
+                # Check if it's a person with sufficient confidence
+                if class_id == PERSON_CLASS_ID and confidence > self.detection_confidence:
+                    # Get bounding box coordinates
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    x1, y1, x2, y2 = box.astype(int)
+                    
+                    persons.append((confidence, x1, y1, x2, y2))
+            
+            return persons
+            
+        except Exception as e:
+            print(f"Error in person detection: {e}")
+            return []
+    
+    def _draw_detections(self, frame, detections):
+        """
+        Draw detection boxes on frame
+        
+        Args:
+            frame: Input frame
+            detections: List of (confidence, x1, y1, x2, y2) tuples
+            
+        Returns:
+            frame: Frame with drawn boxes
+        """
+        for conf, x1, y1, x2, y2 in detections:
+            # Draw bounding box
+            color = (0, 255, 0)  # Green for person
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw confidence label
+            label = f"Person: {conf:.2f}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            
+            # Background for label
+            cv2.rectangle(
+                frame,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0], y1),
+                color,
+                -1
+            )
+            
+            # Text label
+            cv2.putText(
+                frame,
+                label,
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                2
+            )
+        
+        return frame
         
     def connect(self):
         """Connect to the camera and initialize services"""
@@ -390,19 +539,22 @@ class PersonAlarmManager:
     def run(self):
         """
         Main run loop - runs at 10Hz and displays video stream
-        Press 'q' to quit
+        Press 'q' to quit, 'd' to toggle detection display
         """
         if not self.video_capture or not self.video_capture.isOpened():
             print("Video capture not initialized")
             return
         
-        print("\n🎥 Starting Person Alarm Manager (Low-Latency Mode)...")
+        detection_status = "ENABLED" if self.enable_detection else "DISABLED"
+        print(f"\n🎥 Starting Person Alarm Manager (Low-Latency Mode)...")
         print("=" * 50)
-        print("Running at 10 Hz with background frame capture")
+        print(f"Running at 10 Hz with background frame capture")
+        print(f"Person Detection: {detection_status}")
         print("Controls:")
         print("  Arrow Keys: Pan/Tilt camera (absolute positioning with speed)")
         print(f"  Pan step: {self.pan_step}, Pan speed: {self.pan_speed}")
         print(f"  Tilt step: {self.tilt_step}, Tilt speed: {self.tilt_speed}")
+        print("  'd': Toggle detection display")
         print("  'q': Quit")
         print("=" * 50)
         
@@ -420,6 +572,14 @@ class PersonAlarmManager:
         fps_start_time = time.time()
         fps_counter = 0
         fps = 0
+        
+        # Detection display toggle
+        show_detections = True
+        
+        # Detection timing (run detection less frequently for performance)
+        detection_interval = 0.2  # Run detection every 200ms (5 Hz)
+        last_detection_run = 0
+        cached_detections = []
         
         # Wait for first frame
         if not self.frame_available.wait(timeout=5.0):
@@ -446,6 +606,27 @@ class PersonAlarmManager:
                 fps_start_time = current_time
                 fps_counter = 0
             
+            # Run person detection at reduced rate for performance
+            if self.enable_detection and (current_time - last_detection_run) >= detection_interval:
+                cached_detections = self._detect_persons(frame)
+                last_detection_run = current_time
+                
+                # Update detection status
+                if len(cached_detections) > 0:
+                    if not self.person_detected:
+                        self.person_detected = True
+                        self.detection_count += 1
+                        self.last_detection_time = current_time
+                        print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
+                else:
+                    if self.person_detected:
+                        print(f"✅ Person left the frame")
+                    self.person_detected = False
+            
+            # Draw detections if enabled
+            if self.enable_detection and show_detections and len(cached_detections) > 0:
+                frame = self._draw_detections(frame, cached_detections)
+            
             # Add overlay information
             height, width = frame.shape[:2]
             
@@ -470,13 +651,26 @@ class PersonAlarmManager:
             cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
+            # Add detection status
+            if self.enable_detection:
+                detection_text = f"Detection: {'ON' if show_detections else 'OFF'} | Persons: {len(cached_detections)} | Total: {self.detection_count}"
+                color = (0, 255, 0) if len(cached_detections) > 0 else (255, 255, 255)
+                cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
             # Show the frame
             cv2.imshow('Person Alarm Manager', frame)
             
             # Reduced waitKey for faster response (1ms instead of 30ms)
             key = cv2.waitKey(1) & 0xFF
             
-            if key != 255:  # 255 means no key was pressed
+            if key == ord('q'):
+                print("\n⏹️  Quit key pressed")
+                break
+            elif key == ord('d'):
+                show_detections = not show_detections
+                print(f"Detection display: {'ON' if show_detections else 'OFF'}")
+            elif key != 255:  # 255 means no key was pressed
                 # Handle arrow keys (non-blocking)
                 self._handle_arrow_keys(key)
             
@@ -529,13 +723,19 @@ def main():
     PAN_SPEED = 0.5   # Speed of movement (0.0 to 1.0) - higher is faster
     TILT_SPEED = 0.5  # Speed of movement (0.0 to 1.0) - higher is faster
     
-    print("🎥 Person Alarm Manager - Tapo C200 (Low-Latency)")
+    # Person detection settings
+    ENABLE_DETECTION = True      # Set to False to disable person detection
+    DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
+    
+    print("🎥 Person Alarm Manager - Tapo C200 (Low-Latency + Person Detection)")
     print("=" * 50)
     print(f"Camera IP: {CAMERA_IP}")
     print(f"Username: {USERNAME}")
     print(f"Password: {'*' * len(PASSWORD)}")
     print(f"Pan Step: {PAN_STEP}, Pan Speed: {PAN_SPEED}")
     print(f"Tilt Step: {TILT_STEP}, Tilt Speed: {TILT_SPEED}")
+    print(f"Person Detection: {'ENABLED' if ENABLE_DETECTION else 'DISABLED'}")
+    print(f"Detection Confidence: {DETECTION_CONFIDENCE}")
     print()
     
     # Create manager instance
@@ -544,7 +744,9 @@ def main():
         pan_step=PAN_STEP,
         tilt_step=TILT_STEP,
         pan_speed=PAN_SPEED,
-        tilt_speed=TILT_SPEED
+        tilt_speed=TILT_SPEED,
+        enable_detection=ENABLE_DETECTION,
+        detection_confidence=DETECTION_CONFIDENCE
     ) 
     
     try:
