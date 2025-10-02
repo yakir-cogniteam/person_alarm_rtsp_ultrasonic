@@ -1,8 +1,26 @@
 #!/usr/bin/env python3
-"""
-TP-Link Tapo C200 ONVIF Controller - Fixed Version
-Connects to Tapo C200 camera via ONVIF protocol for video streaming and PTZ control
-"""
+
+# sudo apt install python3-opencv
+# pip3 install onvif-zeep --break-system-packages
+# cd /home/pi/.local/lib/python3.11/site-packages/wsdl/
+# cd /home/pi/.local/lib/python3.11/site-packages/wsdl
+# cd /home/pi/.local/lib/python3.11/site-packages/
+# mkdir -p wsdl
+# cd wsdl/
+# wget https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl
+# wget https://www.onvif.org/ver10/media/wsdl/media.wsdl
+# wget https://www.onvif.org/ver20/ptz/wsdl/ptz.wsdl
+# wget https://www.onvif.org/ver10/events/wsdl/event.wsdl
+# wget https://www.onvif.org/ver20/imaging/wsdl/imaging.wsdl
+
+# cd /home/pi/.local/lib/
+# mkdir -p ver10/schema
+# mkdir -p ver20/schema
+# wget https://www.onvif.org/ver10/schema/onvif.xsd
+# wget https://www.onvif.org/ver10/schema/common.xsd
+# cd ../../ver20/schema
+# wget https://www.onvif.org/ver20/schema/onvif.xsd
+
 
 import cv2
 import time
@@ -521,7 +539,7 @@ class TapoC200Controller:
 
 def main():
     # Camera configuration - Update these values
-    CAMERA_IP = "192.168.1.84"  # Your camera's IP
+    CAMERA_IP = "192.168.1.143"  # Your camera's IP
     USERNAME = "admin123"        # Your camera username  
     PASSWORD = "admin123"        # Your camera password
     
