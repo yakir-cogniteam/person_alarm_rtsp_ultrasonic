@@ -71,6 +71,11 @@ class PersonAlarmManager:
         self.detection_count = 0
         self.last_detection_time = 0
         
+        # MODIFIED: Detection activation control
+        self.detection_active = False
+        self.detection_start_time = 0
+        self.detection_duration = 10.0  # 10 seconds
+        
         # Initialize detector if enabled
         if self.enable_detection:
             self._init_person_detector()
@@ -81,8 +86,8 @@ class PersonAlarmManager:
             print("Initializing person detector (MobileNet SSD)...")
             
             # Paths for the model files
-            prototxt_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
-            model_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
+            prototxt_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
+            model_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
             
             # Check if model files exist
             if not os.path.exists(prototxt_path) or not os.path.exists(model_path):
@@ -116,6 +121,33 @@ class PersonAlarmManager:
             self.enable_detection = False
             return False
     
+    def activate_detection(self):
+        """Activate person detection for 10 seconds"""
+        self.detection_active = True
+        self.detection_start_time = time.time()
+        print(f"\n🔍 PERSON DETECTION ACTIVATED for {self.detection_duration} seconds!")
+        print("=" * 50)
+    
+    def check_detection_timeout(self):
+        """Check if detection duration has elapsed"""
+        if self.detection_active:
+            elapsed = time.time() - self.detection_start_time
+            if elapsed >= self.detection_duration:
+                self.detection_active = False
+                print(f"\n⏱️  PERSON DETECTION DEACTIVATED (completed {self.detection_duration} seconds)")
+                print("   Press SPACE to activate detection again")
+                print("=" * 50)
+                return True
+        return False
+    
+    def get_remaining_detection_time(self):
+        """Get remaining detection time in seconds"""
+        if not self.detection_active:
+            return 0
+        elapsed = time.time() - self.detection_start_time
+        remaining = max(0, self.detection_duration - elapsed)
+        return remaining
+    
     def _detect_persons(self, frame):
         """
         Detect persons in frame using MobileNet SSD
@@ -127,6 +159,10 @@ class PersonAlarmManager:
             detections: List of (confidence, x1, y1, x2, y2) tuples for detected persons
         """
         if not self.enable_detection or self.net is None:
+            return []
+        
+        # MODIFIED: Only detect if detection is active
+        if not self.detection_active:
             return []
         
         try:
@@ -539,13 +575,13 @@ class PersonAlarmManager:
     def run(self):
         """
         Main run loop - runs at 10Hz and displays video stream
-        Press 'q' to quit, 'd' to toggle detection display
+        Press 'q' to quit, 'd' to toggle detection display, SPACE to activate detection
         """
         if not self.video_capture or not self.video_capture.isOpened():
             print("Video capture not initialized")
             return
         
-        detection_status = "ENABLED" if self.enable_detection else "DISABLED"
+        detection_status = "ENABLED (SPACE to activate)" if self.enable_detection else "DISABLED"
         print(f"\n🎥 Starting Person Alarm Manager (Low-Latency Mode)...")
         print("=" * 50)
         print(f"Running at 10 Hz with background frame capture")
@@ -554,6 +590,7 @@ class PersonAlarmManager:
         print("  Arrow Keys: Pan/Tilt camera (absolute positioning with speed)")
         print(f"  Pan step: {self.pan_step}, Pan speed: {self.pan_speed}")
         print(f"  Tilt step: {self.tilt_step}, Tilt speed: {self.tilt_speed}")
+        print("  SPACE: Activate person detection for 10 seconds")
         print("  'd': Toggle detection display")
         print("  'q': Quit")
         print("=" * 50)
@@ -606,8 +643,11 @@ class PersonAlarmManager:
                 fps_start_time = current_time
                 fps_counter = 0
             
-            # Run person detection at reduced rate for performance
-            if self.enable_detection and (current_time - last_detection_run) >= detection_interval:
+            # MODIFIED: Check if detection timeout has elapsed
+            self.check_detection_timeout()
+            
+            # Run person detection at reduced rate for performance (only when active)
+            if self.enable_detection and self.detection_active and (current_time - last_detection_run) >= detection_interval:
                 cached_detections = self._detect_persons(frame)
                 last_detection_run = current_time
                 
@@ -621,6 +661,12 @@ class PersonAlarmManager:
                 else:
                     if self.person_detected:
                         print(f"✅ Person left the frame")
+                    self.person_detected = False
+            
+            # Clear cached detections if detection is not active
+            if not self.detection_active:
+                if len(cached_detections) > 0:
+                    cached_detections = []
                     self.person_detected = False
             
             # Draw detections if enabled
@@ -651,10 +697,16 @@ class PersonAlarmManager:
             cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            # Add detection status
+            # MODIFIED: Add detection status with timer
             if self.enable_detection:
-                detection_text = f"Detection: {'ON' if show_detections else 'OFF'} | Persons: {len(cached_detections)} | Total: {self.detection_count}"
-                color = (0, 255, 0) if len(cached_detections) > 0 else (255, 255, 255)
+                if self.detection_active:
+                    remaining = self.get_remaining_detection_time()
+                    detection_text = f"Detection: ACTIVE ({remaining:.1f}s) | Persons: {len(cached_detections)} | Total: {self.detection_count}"
+                    color = (0, 255, 0) if len(cached_detections) > 0 else (0, 255, 255)  # Green if detected, yellow if active
+                else:
+                    detection_text = f"Detection: INACTIVE (Press SPACE to activate) | Total: {self.detection_count}"
+                    color = (128, 128, 128)  # Gray when inactive
+                
                 cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
@@ -670,6 +722,11 @@ class PersonAlarmManager:
             elif key == ord('d'):
                 show_detections = not show_detections
                 print(f"Detection display: {'ON' if show_detections else 'OFF'}")
+            elif key == ord(' '):  # MODIFIED: Space key to activate detection
+                if self.enable_detection:
+                    self.activate_detection()
+                else:
+                    print("⚠️  Person detection is disabled")
             elif key != 255:  # 255 means no key was pressed
                 # Handle arrow keys (non-blocking)
                 self._handle_arrow_keys(key)
@@ -727,15 +784,16 @@ def main():
     ENABLE_DETECTION = True      # Set to False to disable person detection
     DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
     
-    print("🎥 Person Alarm Manager - Tapo C200 (Low-Latency + Person Detection)")
+    print("🎥 Person Alarm Manager - Tapo C200 (Space-Activated Detection)")
     print("=" * 50)
     print(f"Camera IP: {CAMERA_IP}")
     print(f"Username: {USERNAME}")
     print(f"Password: {'*' * len(PASSWORD)}")
     print(f"Pan Step: {PAN_STEP}, Pan Speed: {PAN_SPEED}")
     print(f"Tilt Step: {TILT_STEP}, Tilt Speed: {TILT_SPEED}")
-    print(f"Person Detection: {'ENABLED' if ENABLE_DETECTION else 'DISABLED'}")
+    print(f"Person Detection: {'ENABLED (Press SPACE to activate)' if ENABLE_DETECTION else 'DISABLED'}")
     print(f"Detection Confidence: {DETECTION_CONFIDENCE}")
+    print(f"Detection Duration: 10 seconds")
     print()
     
     # Create manager instance
