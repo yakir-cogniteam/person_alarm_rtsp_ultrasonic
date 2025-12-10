@@ -7,15 +7,9 @@ from zeep import wsse
 import threading
 import numpy as np
 import os
+import pyaudio
+import wave
 
-# Import pytapo for Tapo-specific alarm control
-try:
-    from pytapo import Tapo
-    PYTAPO_AVAILABLE = True
-except ImportError:
-    PYTAPO_AVAILABLE = False
-    print("⚠️  pytapo library not found. Install with: pip install pytapo")
-    print("   Alarm feature will be limited without pytapo")
 
 
 class PersonAlarmManager:
@@ -98,7 +92,8 @@ class PersonAlarmManager:
         
         # Initialize detector if enabled
         if self.enable_detection:
-            self._init_person_detector()
+            if(self._init_person_detector() == False):
+                exit(-1)
     
     def _init_person_detector(self):
         """Initialize MobileNet SSD person detector (optimized for Raspberry Pi)"""
@@ -106,8 +101,11 @@ class PersonAlarmManager:
             print("Initializing person detector (MobileNet SSD)...")
             
             # Paths for the model files
-            prototxt_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
-            model_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
+            # prototxt_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
+            # model_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
+
+            prototxt_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
+            model_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
             
             # Check if model files exist
             if not os.path.exists(prototxt_path) or not os.path.exists(model_path):
@@ -237,90 +235,44 @@ class PersonAlarmManager:
             return False
     
     def play_beep(self):
-        """Play a beep sound through the camera speaker"""
-        if not self.beep_on_detection:
-            return False
         
-        # Check cooldown to avoid spamming beeps
-        current_time = time.time()
-        if current_time - self.last_beep_time < self.beep_cooldown:
-            return False
-        
-        # Try Tapo-specific method first (best for C200)
-        if self.tapo_alarm_available:
-            success = self.play_tapo_alarm(duration=1.0)
-            if success:
-                self.last_beep_time = current_time
-                return True
-        
-        # Fallback to ONVIF methods if Tapo method fails
-        if not self.device_service or not self.audio_available:
-            return False
-        
+        file_path = '/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/sounds/beep.wav'
+    
         try:
-            # Method 1: Try using RelayOutput (some cameras use relay for alarm)
-            try:
-                # Get relay outputs
-                relay_outputs = self.device_service.GetRelayOutputs()
-                if relay_outputs and len(relay_outputs) > 0:
-                    # Trigger the first relay output
-                    relay_token = relay_outputs[0].token
-                    
-                    # Create trigger request
-                    trigger_request = self.device_service.create_type('SetRelayOutputState')
-                    trigger_request.RelayOutputToken = relay_token
-                    trigger_request.LogicalState = 'active'
-                    
-                    self.device_service.SetRelayOutputState(trigger_request)
-                    
-                    # Deactivate after short delay (in separate thread)
-                    def deactivate_relay():
-                        time.sleep(0.3)  # 300ms beep
-                        try:
-                            trigger_request.LogicalState = 'inactive'
-                            self.device_service.SetRelayOutputState(trigger_request)
-                        except:
-                            pass
-                    
-                    threading.Thread(target=deactivate_relay, daemon=True).start()
-                    
-                    self.last_beep_time = current_time
-                    print("🔊 BEEP! (Relay triggered)")
-                    return True
-            except Exception as relay_error:
-                pass  # Try next method
+            # Open the WAV file
+            wf = wave.open(file_path, 'rb')
             
-            # Method 2: Try using AudioOutput configuration
-            try:
-                audio_outputs = self.device_service.GetAudioOutputs()
-                if audio_outputs and len(audio_outputs) > 0:
-                    audio_token = audio_outputs[0].token
-                    
-                    # Try to set audio output to generate a tone
-                    # Note: This method varies by camera manufacturer
-                    audio_config = self.device_service.create_type('SetAudioOutputConfiguration')
-                    audio_config.Configuration = {
-                        'token': audio_token,
-                        'OutputLevel': 80  # Volume level (0-100)
-                    }
-                    
-                    self.device_service.SetAudioOutputConfiguration(audio_config)
-                    
-                    self.last_beep_time = current_time
-                    print("🔊 BEEP! (Audio output triggered)")
-                    return True
-            except Exception as audio_error:
-                pass  # Try next method
+            # Create PyAudio instance
+            p = pyaudio.PyAudio()
             
-            # Method 3: Try using System Reboot command as alarm (not recommended but works on some cameras)
-            # We'll skip this as it could disrupt operation
+            # Open stream
+            stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
+                            channels=wf.getnchannels(),
+                            rate=wf.getframerate(),
+                            output=True)
             
-            print("⚠️  Could not trigger beep - camera may not support audio alarm via ONVIF")
-            return False
+            # Read and play data in chunks
+            chunk_size = 1024
+            data = wf.readframes(chunk_size)
             
+            print(f"🔊 Playing: {file_path}")
+            
+            while data:
+                stream.write(data)
+                data = wf.readframes(chunk_size)
+            
+            # Cleanup
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            wf.close()
+            
+            print("✅ Playback finished")
+            
+        except FileNotFoundError:
+            print(f"❌ Error: File '{file_path}' not found")
         except Exception as e:
-            print(f"⚠️  Failed to play beep: {e}")
-            return False
+            print(f"❌ Error playing audio: {e}")
     
     def activate_detection(self):
         """Activate person detection for 10 seconds"""
@@ -483,7 +435,7 @@ class PersonAlarmManager:
                 self.device_service = None
             
             # Initialize Tapo controller for alarm
-            self._init_tapo_controller()
+            # self._init_tapo_controller()
             
             # Get stream URL (prioritize stream2 for lower latency)
             self._get_stream_url()
@@ -736,7 +688,7 @@ class PersonAlarmManager:
         Execute PTZ move in a separate thread
         
         Args:
-            direction (str): 'left', 'right', 'up', or 'down'
+            direction (str): 'left', 'right', 'up', 'down', or 'home'
         """
         with self.ptz_lock:
             if direction == 'left':
@@ -751,7 +703,14 @@ class PersonAlarmManager:
             elif direction == 'down':
                 new_tilt = self.current_tilt - self.tilt_step
                 self.abs_tilt(new_tilt)
+            elif direction == 'home':
+                self.go_home()
     
+    def go_home(self):
+        self.abs_pan(0.0, 1)
+        self.abs_tilt(0.0, 1)
+
+
     def _handle_arrow_keys(self, key):
         """
         Handle arrow key presses for camera control
@@ -761,11 +720,11 @@ class PersonAlarmManager:
         """
         direction = None
         
-        if key == 81 or key == 2:  # Left arrow
+        if key == 83 or key == 3:  # Left arrow
             direction = 'left'
             print(f"⬅️  Left arrow: pan {self.current_pan:.2f} -> {self.current_pan - self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
             
-        elif key == 83 or key == 3:  # Right arrow
+        elif key == 81 or key == 2:  # Right arrow
             direction = 'right'
             print(f"➡️  Right arrow: pan {self.current_pan:.2f} -> {self.current_pan + self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
             
@@ -777,6 +736,13 @@ class PersonAlarmManager:
             direction = 'down'
             print(f"⬇️  Down arrow: tilt {self.current_tilt:.2f} -> {self.current_tilt - self.tilt_step:.2f} (speed: {self.tilt_speed:.2f})")
         
+        elif key == ord('h') or key == ord('H'):  # 'h' or 'H' key
+
+            direction = 'home'
+
+        elif key == ord('b') or key == ord('B'):  # BEEP Key:
+            self.play_beep()
+
         # Execute PTZ move in separate thread (non-blocking)
         if direction:
             if self.ptz_thread is None or not self.ptz_thread.is_alive():
@@ -788,36 +754,11 @@ class PersonAlarmManager:
                 self.ptz_thread.start()
     
     def run(self):
-        """
-        Main run loop - runs at 10Hz and displays video stream
-        Press 'q' to quit, 'd' to toggle detection display, SPACE to activate detection
-        """
+     
         if not self.video_capture or not self.video_capture.isOpened():
             print("Video capture not initialized")
             return
-        
-        detection_status = "ENABLED (SPACE to activate)" if self.enable_detection else "DISABLED"
-        print(f"\n🎥 Starting Person Alarm Manager (Low-Latency Mode)...")
-        print("=" * 50)
-        print(f"Running at 10 Hz with background frame capture")
-        print(f"Person Detection: {detection_status}")
-        print("Controls:")
-        print("  Arrow Keys: Pan/Tilt camera (absolute positioning with speed)")
-        print(f"  Pan step: {self.pan_step}, Pan speed: {self.pan_speed}")
-        print(f"  Tilt step: {self.tilt_step}, Tilt speed: {self.tilt_speed}")
-        print("  SPACE: Activate person detection for 10 seconds")
-        print("  'd': Toggle detection display")
-        print("  'b': Toggle beep on/off")
-        print("  'q': Quit")
-        beep_status = "ON" if self.beep_on_detection else "OFF"
-        if self.tapo_alarm_available:
-            audio_status = "AVAILABLE (Tapo API)"
-        elif self.audio_available:
-            audio_status = "AVAILABLE (ONVIF)"
-        else:
-            audio_status = "NOT AVAILABLE"
-        print(f"Audio Beep: {beep_status} (Hardware: {audio_status})")
-        print("=" * 50)
+   
         
         self.running = True
         
@@ -883,7 +824,6 @@ class PersonAlarmManager:
                         self.last_detection_time = current_time
                         print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
                         
-                        # ADDED: Play beep when person is detected
                         self.play_beep()
                 else:
                     if self.person_detected:
@@ -945,19 +885,13 @@ class PersonAlarmManager:
             
             if key == ord('q'):
                 print("\n⏹️  Quit key pressed")
-                break
-            elif key == ord('d'):
-                show_detections = not show_detections
-                print(f"Detection display: {'ON' if show_detections else 'OFF'}")
+                break            
             elif key == ord(' '):  # MODIFIED: Space key to activate detection
                 if self.enable_detection:
                     self.activate_detection()
                 else:
                     print("⚠️  Person detection is disabled")
-            elif key == ord('b'):  # ADDED: Toggle beep
-                self.beep_on_detection = not self.beep_on_detection
-                status = "ON" if self.beep_on_detection else "OFF"
-                print(f"🔊 Beep on detection: {status}")
+           
             elif key != 255:  # 255 means no key was pressed
                 # Handle arrow keys (non-blocking)
                 self._handle_arrow_keys(key)
@@ -968,10 +902,7 @@ class PersonAlarmManager:
             
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            else:
-                # If we're running slower than 10 Hz, print a warning occasionally
-                if frame_count % 100 == 0:
-                    print(f"⚠️ Warning: Loop running slower than {target_hz} Hz")
+            
             
             frame_count += 1
         
@@ -1015,24 +946,7 @@ def main():
     ENABLE_DETECTION = True      # Set to False to disable person detection
     DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
     
-    print("🎥 Person Alarm Manager - Tapo C200 (Space-Activated Detection + Alarm)")
-    print("=" * 70)
-    print(f"Camera IP: {CAMERA_IP}")
-    print(f"Username: {USERNAME}")
-    print(f"Password: {'*' * len(PASSWORD)}")
-    print(f"Pan Step: {PAN_STEP}, Pan Speed: {PAN_SPEED}")
-    print(f"Tilt Step: {TILT_STEP}, Tilt Speed: {TILT_SPEED}")
-    print(f"Person Detection: {'ENABLED (Press SPACE to activate)' if ENABLE_DETECTION else 'DISABLED'}")
-    print(f"Detection Confidence: {DETECTION_CONFIDENCE}")
-    print(f"Detection Duration: 10 seconds")
-    
-    if not PYTAPO_AVAILABLE:
-        print("\n⚠️  WARNING: pytapo library not installed!")
-        print("   Install it with: pip install pytapo")
-        print("   Without pytapo, alarm feature may not work properly on Tapo C200")
-    
-    print()
-    
+ 
     # Create manager instance
     manager = PersonAlarmManager(
         CAMERA_IP, USERNAME, PASSWORD,
@@ -1047,18 +961,12 @@ def main():
     try:
         # Connect to camera
         print("🔗 Connecting to camera...")
-        if not manager.connect():
-            print("\n❌ Failed to connect to camera. Please check:")
-            print("1. Camera IP address is correct")
-            print("2. Camera is powered on and connected to network")
-            print("3. ONVIF is enabled in camera settings")
-            print("4. Username and password are correct")
+        if not manager.connect():       
             return
         
         print("✅ Successfully connected!")
         
         # Start the main run loop
-        print("\n▶️ Starting main run loop...")
         manager.run()
         
     except KeyboardInterrupt:

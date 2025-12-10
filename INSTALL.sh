@@ -1,5 +1,6 @@
 # sudo apt install python3-opencv
 # pip3 install onvif-zeep --break-system-packages
+# sudo apt-get install portaudio19-dev python3-pyaudio
 # cd /home/pi/.local/lib/python3.11/site-packages/wsdl/
 # cd /home/pi/.local/lib/python3.11/site-packages/wsdl
 # cd /home/pi/.local/lib/python3.11/site-packages/
