@@ -9,27 +9,15 @@ import numpy as np
 import os
 import pyaudio
 import wave
-
+import math
 
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
-                 pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.5):
-        """
-        Initialize Person Alarm Manager for Tapo C200 camera
-        
-        Args:
-            camera_ip (str): IP address of the camera
-            username (str): Camera username
-            password (str): Camera password
-            port (int): ONVIF port (default 2020 for Tapo cameras)
-            pan_step (float): Step size for pan adjustment (default 0.1)
-            tilt_step (float): Step size for tilt adjustment (default 0.1)
-            pan_speed (float): Pan movement speed in range [0.0, 1.0] (default 0.5)
-            tilt_speed (float): Tilt movement speed in range [0.0, 1.0] (default 0.5)
-            enable_detection (bool): Enable person detection (default True)
-            detection_confidence (float): Minimum confidence for detection (default 0.5)
-        """
+                 pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2):
+
+        #"/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic
+        self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
         self.camera_ip = camera_ip
         self.username = username
         self.password = password
@@ -40,7 +28,16 @@ class PersonAlarmManager:
         self.imaging_service = None
         self.stream_url = None
         self.video_capture = None
+        self.lidar_port_ok = True
         self.running = False
+
+        self.lidar_target_deg = None
+        self.rotating_to_target_active = False
+        self.wanted_pan = None
+        self.min_pan_deg = -180
+        self.max_pan_deg = 180 
+        self.conut_frame_for_detect = 0
+        self.MAX_FRAMES_DETECTION = 20
         
         # Step sizes for arrow key adjustments
         self.pan_step = pan_step
@@ -86,9 +83,6 @@ class PersonAlarmManager:
         self.last_beep_time = 0
         self.beep_cooldown = 2.0  # Minimum seconds between beeps
         
-        # Tapo-specific alarm control
-        self.tapo_controller = None
-        self.tapo_alarm_available = False
         
         # Initialize detector if enabled
         if self.enable_detection:
@@ -100,27 +94,10 @@ class PersonAlarmManager:
         try:
             print("Initializing person detector (MobileNet SSD)...")
             
-            # Paths for the model files
-            # prototxt_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
-            # model_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
 
-            prototxt_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.prototxt"
-            model_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/model/MobileNetSSD_deploy.caffemodel"
-            
-            # Check if model files exist
-            if not os.path.exists(prototxt_path) or not os.path.exists(model_path):
-                print("\n" + "="*60)
-                print("⚠️  MODEL FILES NOT FOUND!")
-                print("="*60)
-                print("Please download the MobileNet SSD model files:")
-                print("\n1. Download prototxt file:")
-                print("   wget https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt")
-                print("\n2. Download caffemodel file:")
-                print("   wget https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel")
-                print("\nOr use the script in the repository to download them automatically.")
-                print("="*60)
-                self.enable_detection = False
-                return False
+            prototxt_path = self.ws_path + "/model/MobileNetSSD_deploy.prototxt"
+            model_path = self.ws_path + "/model/MobileNetSSD_deploy.caffemodel"
+           
             
             # Load the MobileNet SSD model
             self.net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
@@ -139,104 +116,12 @@ class PersonAlarmManager:
             self.enable_detection = False
             return False
     
-    def _check_audio_capabilities(self):
-        """Check if camera supports audio output"""
-        try:
-            if not self.device_service:
-                self.audio_available = False
-                return
-            
-            # Try to get audio output configuration
-            audio_outputs = self.device_service.GetAudioOutputs()
-            
-            if audio_outputs:
-                print(f"✅ Audio output available: {len(audio_outputs)} output(s)")
-                self.audio_available = True
-                
-                # Print audio output details
-                for i, output in enumerate(audio_outputs):
-                    print(f"   Audio Output {i}: Token={output.token}")
-            else:
-                print("⚠️  No audio outputs found")
-                self.audio_available = False
-                
-        except Exception as e:
-            print(f"⚠️  Could not check audio capabilities: {e}")
-            self.audio_available = False
     
-    def _init_tapo_controller(self):
-        """Initialize Tapo controller for alarm functionality"""
-        if not PYTAPO_AVAILABLE:
-            print("⚠️  Tapo controller not available (pytapo not installed)")
-            return
-        
-        try:
-            print("Initializing Tapo controller for alarm functionality...")
-            self.tapo_controller = Tapo(self.camera_ip, self.username, self.password)
-            
-            # Test if we can get basic info
-            basic_info = self.tapo_controller.getBasicInfo()
-            if basic_info:
-                print("✅ Tapo controller initialized successfully")
-                self.tapo_alarm_available = True
-                
-                # Get alarm config to verify it's supported
-                try:
-                    alarm_config = self.tapo_controller.getAlarmConfig()
-                    print(f"   Alarm feature detected: {alarm_config}")
-                except Exception as alarm_e:
-                    print(f"   Note: Could not verify alarm config: {alarm_e}")
-            else:
-                print("⚠️  Could not verify Tapo controller")
-                self.tapo_alarm_available = False
-                
-        except Exception as e:
-            print(f"⚠️  Failed to initialize Tapo controller: {e}")
-            print("   Tapo alarm feature will not be available")
-            self.tapo_alarm_available = False
     
-    def play_tapo_alarm(self, duration=1.0):
-        """
-        Play alarm sound through Tapo camera using pytapo library
-        
-        Args:
-            duration (float): Duration of the alarm in seconds (default 1.0)
-        """
-        if not self.tapo_alarm_available or not self.tapo_controller:
-            return False
-        
-        try:
-            # Use testUsrDefAudio method which triggers the manual alarm
-            # Parameters: sound_type (1-10), enabled (True/False)
-            # Sound types: different alarm sounds
-            sound_type = "1"  # Default alarm sound
-            
-            print(f"🔊 Triggering Tapo alarm (sound type {sound_type})...")
-            
-            # Start the alarm
-            result = self.tapo_controller.testUsrDefAudio(sound_type, True)
-            
-            # Schedule alarm stop after duration
-            def stop_alarm():
-                time.sleep(duration)
-                try:
-                    self.tapo_controller.testUsrDefAudio(sound_type, False)
-                    print("   Alarm stopped")
-                except:
-                    pass
-            
-            threading.Thread(target=stop_alarm, daemon=True).start()
-            
-            return True
-            
-        except Exception as e:
-            print(f"⚠️  Failed to trigger Tapo alarm: {e}")
-            print(f"   Error details: {type(e).__name__}")
-            return False
     
     def play_beep(self):
         
-        file_path = '/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/sounds/beep.wav'
+        file_path = self.ws_path + "/sounds/beep.wav"
     
         try:
             # Open the WAV file
@@ -273,33 +158,7 @@ class PersonAlarmManager:
             print(f"❌ Error: File '{file_path}' not found")
         except Exception as e:
             print(f"❌ Error playing audio: {e}")
-    
-    def activate_detection(self):
-        """Activate person detection for 10 seconds"""
-        self.detection_active = True
-        self.detection_start_time = time.time()
-        print(f"\n🔍 PERSON DETECTION ACTIVATED for {self.detection_duration} seconds!")
-        print("=" * 50)
-    
-    def check_detection_timeout(self):
-        """Check if detection duration has elapsed"""
-        if self.detection_active:
-            elapsed = time.time() - self.detection_start_time
-            if elapsed >= self.detection_duration:
-                self.detection_active = False
-                print(f"\n⏱️  PERSON DETECTION DEACTIVATED (completed {self.detection_duration} seconds)")
-                print("   Press SPACE to activate detection again")
-                print("=" * 50)
-                return True
-        return False
-    
-    def get_remaining_detection_time(self):
-        """Get remaining detection time in seconds"""
-        if not self.detection_active:
-            return 0
-        elapsed = time.time() - self.detection_start_time
-        remaining = max(0, self.detection_duration - elapsed)
-        return remaining
+       
     
     def _detect_persons(self, frame):
         """
@@ -337,7 +196,6 @@ class PersonAlarmManager:
             
             # MobileNet SSD class IDs: 15 = person
             PERSON_CLASS_ID = 15
-            
             for i in range(detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
                 class_id = int(detections[0, 0, i, 1])
@@ -423,19 +281,9 @@ class PersonAlarmManager:
             except Exception as e:
                 print(f"Warning: Imaging service not available: {e}")
             
-            # Get device management service for audio alarm
-            try:
-                self.device_service = self.camera.create_devicemgmt_service()
-                print("Device management service initialized successfully")
-                
-                # Check if audio output is available
-                self._check_audio_capabilities()
-            except Exception as e:
-                print(f"Warning: Device management service not available: {e}")
-                self.device_service = None
+           
             
             # Initialize Tapo controller for alarm
-            # self._init_tapo_controller()
             
             # Get stream URL (prioritize stream2 for lower latency)
             self._get_stream_url()
@@ -567,6 +415,27 @@ class PersonAlarmManager:
             print(f"Failed to initialize video stream: {e}")
             return False
     
+    def _lidar_thread(self):
+
+        lidar_strat_time = time.time()
+
+        send_cmd = False
+        if self.lidar_port_ok:
+            while self.running:
+                
+                elapsed = time.time() - lidar_strat_time
+
+                if (elapsed > 30 and send_cmd == False):
+                    send_cmd = True
+
+                    self.lidar_target_deg = -100                  
+
+
+                time.sleep(0.01)  # Brief pause on failure
+
+
+
+
     def _frame_capture_thread(self):
         """Continuously capture frames in background thread to avoid buffering"""
         print("Frame capture thread started")
@@ -707,6 +576,7 @@ class PersonAlarmManager:
                 self.go_home()
     
     def go_home(self):
+        print('go home')
         self.abs_pan(0.0, 1)
         self.abs_tilt(0.0, 1)
 
@@ -753,19 +623,91 @@ class PersonAlarmManager:
                 self.ptz_thread.daemon = True
                 self.ptz_thread.start()
     
+   
+    
+    def rotate_to_target(self, lidar_target_deg):
+        onvif_pan = self.pan_degrees_to_onvif(lidar_target_deg)
+        self.abs_pan(onvif_pan, 1)
+
+        self.wanted_pan = onvif_pan
+
+
+    def pan_degrees_to_onvif(self, degrees):
+        """Convert degrees to ONVIF normalized value"""
+        # Clamp to valid range first
+        deg_clamped = max(self.min_pan_deg, min(self.max_pan_deg, degrees))
+        
+        # Map degree range to ONVIF range [-1, 1]
+        onvif_value = ((deg_clamped - self.min_pan_deg) * 2.0 / (self.max_pan_deg - self.min_pan_deg)) - 1.0
+        
+        return onvif_value * -1.0
+    
+    def pan_onvif_to_degrees(self, onvif_value):
+        """Convert ONVIF normalized value to degrees"""
+        # Clamp ONVIF value to valid range
+        onvif_clamped = max(-1.0, min(1.0, onvif_value))
+        
+        # Map ONVIF range [-1, 1] to degree range
+        degrees = -1.0 * ((onvif_clamped + 1.0) * (self.max_pan_deg - self.min_pan_deg) / 2.0) + self.min_pan_deg
+        
+        return degrees
+
+    def get_current_ptz(self):
+        try:
+            # Get first available profile
+            media_service = self.camera.create_media_service()
+            profiles = media_service.GetProfiles()
+            profile_token = profiles[0].token if profiles else None
+            
+            if not profile_token:
+                print("No media profiles available")
+                return 0.0, 0.0, 0.0
+            
+            status = self.ptz_service.GetStatus({'ProfileToken': profile_token})
+            
+            # Check if status is valid
+            if status is None:
+                print("Status is None")
+                return 0.0, 0.0, 0.0
+            
+            # Access attributes directly (not using .get())
+            if not hasattr(status, 'Position') or status.Position is None:
+                print("Position attribute not available")
+                return 0.0, 0.0, 0.0
+            
+            pos = status.Position
+            
+            # Access PanTilt and Zoom attributes directly
+            pan = pos.PanTilt.x if hasattr(pos, 'PanTilt') and pos.PanTilt else 0.0
+            tilt = pos.PanTilt.y if hasattr(pos, 'PanTilt') and pos.PanTilt else 0.0
+            zoom = pos.Zoom.x if hasattr(pos, 'Zoom') and pos.Zoom else 0.0
+
+            return pan, tilt, zoom
+            
+        except Exception as e:
+            print(f'Error getting PTZ: {e}')
+            import traceback
+            traceback.print_exc()
+            return 0.0, 0.0, 0.0
+
     def run(self):
      
         if not self.video_capture or not self.video_capture.isOpened():
             print("Video capture not initialized")
             return
    
-        
+        self.go_home()
         self.running = True
         
         # Start background frame capture thread
         self.capture_thread = threading.Thread(target=self._frame_capture_thread)
         self.capture_thread.daemon = True
         self.capture_thread.start()
+
+        # Start background frame capture thread
+        self.lidar_thread = threading.Thread(target=self._lidar_thread)
+        self.lidar_thread.daemon = True
+        self.lidar_thread.start()
         
         target_hz = 10
         target_interval = 1.0 / target_hz  # 0.1 seconds for 10 Hz
@@ -808,75 +750,67 @@ class PersonAlarmManager:
                 fps_start_time = current_time
                 fps_counter = 0
             
-            # MODIFIED: Check if detection timeout has elapsed
-            self.check_detection_timeout()
-            
-            # Run person detection at reduced rate for performance (only when active)
-            if self.enable_detection and self.detection_active and (current_time - last_detection_run) >= detection_interval:
-                cached_detections = self._detect_persons(frame)
-                last_detection_run = current_time
+
+            if self.rotating_to_target_active:
                 
-                # Update detection status
-                if len(cached_detections) > 0:
-                    if not self.person_detected:
-                        self.person_detected = True
-                        self.detection_count += 1
-                        self.last_detection_time = current_time
-                        print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
+                pan, tilt, zoom = self.get_current_ptz()
+                
+                if math.fabs(self.wanted_pan - pan) < 0.05:
+
+                    self.conut_frame_for_detect+= 1
+
+
+                    if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
+                        self.rotating_to_target_active = False
+                        self.conut_frame_for_detect = 0
+
+                    self.enable_detection = True
+                    self.detection_active = True
+                    detections = self._detect_persons(frame)
+                    if len(detections) > 0:
+
+                        self.rotating_to_target_active = False
+                        self.conut_frame_for_detect = 0
                         
+                        print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
+                            
                         self.play_beep()
-                else:
-                    if self.person_detected:
-                        print(f"✅ Person left the frame")
-                    self.person_detected = False
-            
-            # Clear cached detections if detection is not active
-            if not self.detection_active:
-                if len(cached_detections) > 0:
-                    cached_detections = []
-                    self.person_detected = False
-            
-            # Draw detections if enabled
-            if self.enable_detection and show_detections and len(cached_detections) > 0:
-                frame = self._draw_detections(frame, cached_detections)
+                        time.sleep(0.1)
+                        self.play_beep()
+                        time.sleep(0.1)
+                        self.play_beep()
+
+
+                        self.enable_detection = False
+                        self.detection_active = False
+
+                        self.go_home()
+
+                    else:
+
+                        print(' noooo person no person !!!!!') 
+                        self.go_home() 
+                
+            if self.lidar_target_deg != None:
+
+                self.rotate_to_target(self.lidar_target_deg)
+                self.lidar_target_deg = None
+                self.rotating_to_target_active = True
+                
+
+               
+
             
             # Add overlay information
             height, width = frame.shape[:2]
             
-            # Add timestamp
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
             
             # Add FPS counter
             if fps > 0:
                 fps_text = f"FPS: {fps:.1f}"
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-            
-            # Add resolution and loop rate info
-            info_text = f"{width}x{height} @ {target_hz}Hz (Low-Latency)"
-            cv2.putText(frame, info_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame, info_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-            
-            # Add PTZ position and speed info
-            ptz_text = f"Pan: {self.current_pan:.2f} (speed: {self.pan_speed:.2f}) | Tilt: {self.current_tilt:.2f} (speed: {self.tilt_speed:.2f})"
-            cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            cv2.putText(frame, ptz_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-            # MODIFIED: Add detection status with timer
-            if self.enable_detection:
-                if self.detection_active:
-                    remaining = self.get_remaining_detection_time()
-                    detection_text = f"Detection: ACTIVE ({remaining:.1f}s) | Persons: {len(cached_detections)} | Total: {self.detection_count}"
-                    color = (0, 255, 0) if len(cached_detections) > 0 else (0, 255, 255)  # Green if detected, yellow if active
-                else:
-                    detection_text = f"Detection: INACTIVE (Press SPACE to activate) | Total: {self.detection_count}"
-                    color = (128, 128, 128)  # Gray when inactive
-                
-                cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.putText(frame, detection_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
+       
             # Show the frame
             cv2.imshow('Person Alarm Manager', frame)
             
@@ -886,12 +820,6 @@ class PersonAlarmManager:
             if key == ord('q'):
                 print("\n⏹️  Quit key pressed")
                 break            
-            elif key == ord(' '):  # MODIFIED: Space key to activate detection
-                if self.enable_detection:
-                    self.activate_detection()
-                else:
-                    print("⚠️  Person detection is disabled")
-           
             elif key != 255:  # 255 means no key was pressed
                 # Handle arrow keys (non-blocking)
                 self._handle_arrow_keys(key)
@@ -908,7 +836,7 @@ class PersonAlarmManager:
         
         cv2.destroyAllWindows()
         print("Run loop stopped")
-    
+
     def disconnect(self):
         """Clean up and disconnect"""
         self.running = False
