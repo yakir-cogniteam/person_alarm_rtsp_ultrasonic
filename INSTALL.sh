@@ -1,6 +1,9 @@
 # sudo apt install python3-opencv
 # pip3 install onvif-zeep --break-system-packages
+# sudo apt-get install mosquitto
 # sudo apt-get install portaudio19-dev python3-pyaudio
+# pip3 install paho-mqtt --break-system-packages
+# sudo apt-get install python3-tk
 # cd /home/pi/.local/lib/python3.11/site-packages/wsdl/
 # cd /home/pi/.local/lib/python3.11/site-packages/wsdl
 # cd /home/pi/.local/lib/python3.11/site-packages/
@@ -20,4 +23,3 @@
 # cd ../../ver20/schema
 # wget https://www.onvif.org/ver20/schema/onvif.xsd
 
-pip3 install pytapo==3.3.15 python-kasa==0.5.0

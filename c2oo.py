@@ -10,14 +10,23 @@ import os
 import pyaudio
 import wave
 import math
+import paho.mqtt.client as mqtt
 
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
-                 pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2):
+                 pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
+                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control"):
 
         #"/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic
         self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
+        
+        # MQTT settings
+        self.mqtt_broker = mqtt_broker
+        self.mqtt_port = mqtt_port
+        self.mqtt_topic = mqtt_topic
+        self.mqtt_client = None
+        self.mqtt_connected = False
         self.camera_ip = camera_ip
         self.username = username
         self.password = password
@@ -32,6 +41,9 @@ class PersonAlarmManager:
         self.running = False
 
         self.lidar_target_deg = None
+        self.is_map_calibrated = False
+        self.calibration_cmd = False
+        self.system_state = 'auto' # auto / manual
         self.rotating_to_target_active = False
         self.wanted_pan = None
         self.min_pan_deg = -180
@@ -116,8 +128,86 @@ class PersonAlarmManager:
             self.enable_detection = False
             return False
     
+    def _setup_mqtt(self):
+        """Setup MQTT client for receiving commands"""
+        try:
+            self.mqtt_client = mqtt.Client(client_id="camera_c200")
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            
+            print(f"🔗 Connecting to MQTT broker at {self.mqtt_broker}:{self.mqtt_port}...")
+            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
+            self.mqtt_client.loop_start()
+            
+        except Exception as e:
+            print(f"❌ Failed to setup MQTT: {e}")
+            self.mqtt_connected = False
+    
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback for MQTT connection"""
+        if rc == 0:
+            print("✅ Connected to MQTT broker")
+            self.mqtt_connected = True
+            # Subscribe to the control topic
+            self.mqtt_client.subscribe(self.mqtt_topic)
+            print(f"📡 Subscribed to topic: {self.mqtt_topic}")
+        else:
+            print(f"❌ Failed to connect to MQTT broker. Code: {rc}")
+            self.mqtt_connected = False
+    
+    def _on_mqtt_disconnect(self, client, userdata, rc):
+        """Callback for MQTT disconnection"""
+        print("⚠️  Disconnected from MQTT broker")
+        self.mqtt_connected = False
+    
+    def _on_mqtt_message(self, client, userdata, msg):
+        
+        
+        """Callback for receiving MQTT messages"""
+        try:
+            command = msg.payload.decode('utf-8')
+            print(f"📥 Received command: {command}")
+
+            self.current_pan, self.current_tilt, self.current_zoom = self.get_current_ptz()
+
+            if command == 'left':
+                new_pan = self.current_pan + self.pan_step
+                self.abs_pan(new_pan)
+            elif command == 'right':
+                new_pan = self.current_pan - self.pan_step
+                self.abs_pan(new_pan)
+            elif command == 'up':
+                new_tilt = self.current_tilt + self.tilt_step
+                self.abs_tilt(new_tilt)
+            elif command == 'down':
+                new_tilt = self.current_tilt - self.tilt_step
+                self.abs_tilt(new_tilt)
+            elif command == 'go_home':
+                self.go_home()
+            elif command == 'switch_state':
+                self.switch_state()
+            elif command == 'sound_test':
+                self.sound_test()
+            elif command == 'calibrate':
+                self.calibration_cmd = True
+                
+        except Exception as e:
+            print(f"❌ Error processing MQTT message: {e}")
     
     
+    def sound_test(self):
+
+        self.play_beep()
+    
+    def switch_state(self):
+
+        if self.system_state == 'manual':
+            self.system_state = 'auto'
+        elif self.system_state == 'manual':
+            self.system_state = 'auto'
+
+        print(f' the state now is {self.system_state}')    
     
     def play_beep(self):
         
@@ -291,6 +381,9 @@ class PersonAlarmManager:
             # Initialize video capture with low-latency settings
             self._init_video_capture()
             
+            # Setup MQTT server
+            self._setup_mqtt()
+            
             print("Successfully connected to Tapo C200")
             return True
             
@@ -425,10 +518,13 @@ class PersonAlarmManager:
                 
                 elapsed = time.time() - lidar_strat_time
 
-                if (elapsed > 30 and send_cmd == False):
-                    send_cmd = True
+                if self.calibration_cmd == True:
+                    self.calibration_cmd = False
+                    print('caliration cmd recived !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11')
+                # if (elapsed > 30 and send_cmd == False):
+                #     send_cmd = True
 
-                    self.lidar_target_deg = -100                  
+                #     self.lidar_target_deg = -100                  
 
 
                 time.sleep(0.01)  # Brief pause on failure
@@ -552,28 +648,28 @@ class PersonAlarmManager:
             print(f"Failed to execute absolute tilt: {e}")
             return False
     
-    def _execute_ptz_move(self, direction):
-        """
-        Execute PTZ move in a separate thread
+    # def _execute_ptz_move(self, direction):
+    #     """
+    #     Execute PTZ move in a separate thread
         
-        Args:
-            direction (str): 'left', 'right', 'up', 'down', or 'home'
-        """
-        with self.ptz_lock:
-            if direction == 'left':
-                new_pan = self.current_pan - self.pan_step
-                self.abs_pan(new_pan)
-            elif direction == 'right':
-                new_pan = self.current_pan + self.pan_step
-                self.abs_pan(new_pan)
-            elif direction == 'up':
-                new_tilt = self.current_tilt + self.tilt_step
-                self.abs_tilt(new_tilt)
-            elif direction == 'down':
-                new_tilt = self.current_tilt - self.tilt_step
-                self.abs_tilt(new_tilt)
-            elif direction == 'home':
-                self.go_home()
+    #     Args:
+    #         direction (str): 'left', 'right', 'up', 'down', or 'home'
+    #     """
+    #     with self.ptz_lock:
+    #         if direction == 'left':
+    #             new_pan = self.current_pan - self.pan_step
+    #             self.abs_pan(new_pan)
+    #         elif direction == 'right':
+    #             new_pan = self.current_pan + self.pan_step
+    #             self.abs_pan(new_pan)
+    #         elif direction == 'up':
+    #             new_tilt = self.current_tilt + self.tilt_step
+    #             self.abs_tilt(new_tilt)
+    #         elif direction == 'down':
+    #             new_tilt = self.current_tilt - self.tilt_step
+    #             self.abs_tilt(new_tilt)
+    #         elif direction == 'home':
+    #             self.go_home()
     
     def go_home(self):
         print('go home')
@@ -811,18 +907,18 @@ class PersonAlarmManager:
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
        
-            # Show the frame
-            cv2.imshow('Person Alarm Manager', frame)
+            # # Show the frame
+            # cv2.imshow('Person Alarm Manager', frame)
             
-            # Reduced waitKey for faster response (1ms instead of 30ms)
-            key = cv2.waitKey(1) & 0xFF
+            # # Reduced waitKey for faster response (1ms instead of 30ms)
+            # key = cv2.waitKey(1) & 0xFF
             
-            if key == ord('q'):
-                print("\n⏹️  Quit key pressed")
-                break            
-            elif key != 255:  # 255 means no key was pressed
-                # Handle arrow keys (non-blocking)
-                self._handle_arrow_keys(key)
+            # if key == ord('q'):
+            #     print("\n⏹️  Quit key pressed")
+            #     break            
+            # elif key != 255:  # 255 means no key was pressed
+            #     # Handle arrow keys (non-blocking)
+            #     self._handle_arrow_keys(key)
             
             # Calculate sleep time to maintain 10 Hz
             loop_elapsed = time.time() - loop_start_time
@@ -840,6 +936,12 @@ class PersonAlarmManager:
     def disconnect(self):
         """Clean up and disconnect"""
         self.running = False
+        
+        # Stop MQTT client
+        if self.mqtt_client:
+            print("Disconnecting MQTT client...")
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
         
         # Wait for capture thread to stop
         if self.capture_thread and self.capture_thread.is_alive():
@@ -864,6 +966,11 @@ def main():
     USERNAME = "admin123"
     PASSWORD = "admin123"
     
+    # MQTT configuration
+    MQTT_BROKER = "localhost"  # Change to your MQTT broker address
+    MQTT_PORT = 1883
+    MQTT_TOPIC = "camera/control"
+    
     # Absolute positioning settings with speed control
     PAN_STEP = 0.1    # Step size for each arrow key press
     TILT_STEP = 0.1   # Step size for each arrow key press
@@ -883,7 +990,10 @@ def main():
         pan_speed=PAN_SPEED,
         tilt_speed=TILT_SPEED,
         enable_detection=ENABLE_DETECTION,
-        detection_confidence=DETECTION_CONFIDENCE
+        detection_confidence=DETECTION_CONFIDENCE,
+        mqtt_broker=MQTT_BROKER,
+        mqtt_port=MQTT_PORT,
+        mqtt_topic=MQTT_TOPIC
     ) 
     
     try:
