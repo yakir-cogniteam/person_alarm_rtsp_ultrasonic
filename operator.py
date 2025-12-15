@@ -357,6 +357,7 @@ class Operator:
             if msg.topic == self.mqtt_status_topic:
                 # Parse JSON status dictionary
                 status_json = msg.payload.decode('utf-8')
+                print(f' status_json: { status_json }')
                 status_dict = json.loads(status_json)
                 
                 # Update local status dictionary

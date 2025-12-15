@@ -16,7 +16,7 @@ import paho.mqtt.client as mqtt
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
                  pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
-                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control"):
+                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status"):
 
         #"/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic
         self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -25,6 +25,7 @@ class PersonAlarmManager:
         self.mqtt_broker = mqtt_broker
         self.mqtt_port = mqtt_port
         self.mqtt_topic = mqtt_topic
+        self.mqtt_status_topic = mqtt_status_topic
         self.mqtt_client = None
         self.mqtt_connected = False
         self.camera_ip = camera_ip
@@ -204,8 +205,8 @@ class PersonAlarmManager:
 
         if self.system_state == 'manual':
             self.system_state = 'auto'
-        elif self.system_state == 'manual':
-            self.system_state = 'auto'
+        elif self.system_state == 'auto':
+            self.system_state = 'manual'
 
         print(f' the state now is {self.system_state}')    
     
@@ -520,6 +521,8 @@ class PersonAlarmManager:
 
                 if self.calibration_cmd == True:
                     self.calibration_cmd = False
+
+                    self.is_map_calibrated = True
                     print('caliration cmd recived !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11')
                 # if (elapsed > 30 and send_cmd == False):
                 #     send_cmd = True
@@ -786,6 +789,33 @@ class PersonAlarmManager:
             traceback.print_exc()
             return 0.0, 0.0, 0.0
 
+    def publish_status(self):
+        """Publish current system status to MQTT"""
+        if not self.mqtt_connected or not self.mqtt_client:
+            return
+        
+        try:
+            import json
+            
+            # Create status dictionary
+            status = {
+                "is_map_calibrated": self.is_map_calibrated,
+                "system_state": self.system_state,
+                "detection_active": self.detection_active,
+                "lidar_port_ok": self.lidar_port_ok,
+                "rotating_to_target": self.rotating_to_target_active,
+                "current_pan": self.current_pan,
+                "current_tilt": self.current_tilt,
+                "timestamp": time.time()
+            }
+            
+            # Convert to JSON and publish
+            status_json = json.dumps(status)
+            self.mqtt_client.publish(self.mqtt_status_topic, status_json)
+            
+        except Exception as e:
+            print(f"❌ Error publishing status: {e}")
+
     def run(self):
      
         if not self.video_capture or not self.video_capture.isOpened():
@@ -820,6 +850,10 @@ class PersonAlarmManager:
         detection_interval = 0.2  # Run detection every 200ms (5 Hz)
         last_detection_run = 0
         cached_detections = []
+        
+        # Status publishing timing
+        status_publish_interval = 0.5  # Publish status every 500ms (2 Hz)
+        last_status_publish = 0
         
         # Wait for first frame
         if not self.frame_available.wait(timeout=5.0):
@@ -920,6 +954,11 @@ class PersonAlarmManager:
             #     # Handle arrow keys (non-blocking)
             #     self._handle_arrow_keys(key)
             
+            # Publish status periodically
+            if current_time - last_status_publish >= status_publish_interval:
+                self.publish_status()
+                last_status_publish = current_time
+            
             # Calculate sleep time to maintain 10 Hz
             loop_elapsed = time.time() - loop_start_time
             sleep_time = target_interval - loop_elapsed
@@ -970,6 +1009,7 @@ def main():
     MQTT_BROKER = "localhost"  # Change to your MQTT broker address
     MQTT_PORT = 1883
     MQTT_TOPIC = "camera/control"
+    MQTT_STATUS_TOPIC = "camera/status"  # Status publishing topic
     
     # Absolute positioning settings with speed control
     PAN_STEP = 0.1    # Step size for each arrow key press
@@ -993,7 +1033,8 @@ def main():
         detection_confidence=DETECTION_CONFIDENCE,
         mqtt_broker=MQTT_BROKER,
         mqtt_port=MQTT_PORT,
-        mqtt_topic=MQTT_TOPIC
+        mqtt_topic=MQTT_TOPIC,
+        mqtt_status_topic=MQTT_STATUS_TOPIC
     ) 
     
     try:
