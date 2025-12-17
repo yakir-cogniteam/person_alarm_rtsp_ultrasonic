@@ -102,6 +102,19 @@ class PersonAlarmManager:
             if(self._init_person_detector() == False):
                 exit(-1)
     
+    def disconnect(self):
+        """Clean up and disconnect"""
+        print("🛑 Stopping all threads...")
+        self.running = False
+        self.lidar_running = False  # Signal LIDAR thread to stop
+        
+        # Wait for LIDAR thread to stop
+        if hasattr(self, 'lidar_thread') and self.lidar_thread and self.lidar_thread.is_alive():
+            print("Waiting for LIDAR thread to stop...")
+            self.lidar_thread.join(timeout=5.0)
+        
+        # ... rest of the disconnect code ...
+
     def _init_person_detector(self):
         """Initialize MobileNet SSD person detector (optimized for Raspberry Pi)"""
         try:
@@ -511,26 +524,188 @@ class PersonAlarmManager:
     
     def _lidar_thread(self):
 
-        lidar_strat_time = time.time()
+        # lidar_strat_time = time.time()
 
-        send_cmd = False
-        if self.lidar_port_ok:
-            while self.running:
+        # send_cmd = False
+        # if self.lidar_port_ok:
+        #     while self.running:
                 
-                elapsed = time.time() - lidar_strat_time
+        #         elapsed = time.time() - lidar_strat_time
 
-                if self.calibration_cmd == True:
-                    self.calibration_cmd = False
+        #         if self.calibration_cmd == True:
+        #             self.calibration_cmd = False
 
-                    self.is_map_calibrated = True
-                    print('caliration cmd recived !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11')
-                # if (elapsed > 30 and send_cmd == False):
-                #     send_cmd = True
+        #             self.is_map_calibrated = True
+        #             print('caliration cmd recived !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11')
+        #         # if (elapsed > 30 and send_cmd == False):
+        #         #     send_cmd = True
 
-                #     self.lidar_target_deg = -100                  
+        #         #     self.lidar_target_deg = -100                  
 
 
-                time.sleep(0.01)  # Brief pause on failure
+        #         time.sleep(0.01)  # Brief pause on failure
+
+        from pyrplidar import PyRPlidar
+        import cv2
+        import numpy as np
+        import math
+        import time
+
+        # Initialize LIDAR
+        lidar = PyRPlidar()
+        lidar.connect(port="/dev/ttyUSB0", baudrate=115200, timeout=3)
+        
+
+        # Get device information
+        try:
+            info = lidar.get_info()
+            print("info:", info)
+
+            if info == 'device is connected':
+                self.lidar_port_ok = True
+        except Exception as e:
+            self.lidar_port_ok = False
+
+        health = lidar.get_health()
+        print("health:", health)
+
+        samplerate = lidar.get_samplerate()
+        print("samplerate:", samplerate)
+
+        # Start motor
+        lidar.set_motor_pwm(500)
+
+        # Get scan modes
+        scan_modes = lidar.get_scan_modes()
+        print("\nAvailable scan modes:")
+        for idx, mode in enumerate(scan_modes):
+            print(f"  Mode {idx}: {mode}")
+
+        # Wait for motor to spin up
+        time.sleep(2)
+
+        # Visualization parameters
+        IMAGE_SIZE = 800  # Size of the display window
+        CENTER = IMAGE_SIZE // 2  # Center point of the image
+        SCALE = 5  # Scale factor (pixels per mm) - adjusted for 3m range
+        MAX_DISTANCE = 3500  # Maximum distance in mm to display
+
+        # Start scanning with mode 2 (Boost)
+        scan_mode = min(2, len(scan_modes) - 1)
+        print(f"\nUsing scan mode: {scan_mode}")
+
+        scan_generator = lidar.start_scan_express(scan_mode)()  # Call the function to get generator
+
+        print("\nStarting visualization... Press 'q' to quit\n")
+
+        frame_count = 0
+
+        try:
+            while True:
+                # Create a white image
+                image = np.ones((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8) * 255
+                
+                # Draw center point (LIDAR position)
+                cv2.circle(image, (CENTER, CENTER), 5, (0, 0, 255), -1)
+                
+                # Draw distance circles for reference (every 500mm)
+                for dist in range(500, MAX_DISTANCE, 500):
+                    radius = int(dist / SCALE)
+                    if radius < CENTER:
+                        cv2.circle(image, (CENTER, CENTER), radius, (200, 200, 200), 1)
+                        # Add distance labels
+                        if dist % 1000 == 0:
+                            label = f"{dist//1000}m"
+                            cv2.putText(image, label, (CENTER + radius - 20, CENTER - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                
+                # Collect points for one complete scan (360 degrees)
+                scan_points = []
+                scan_started = False
+                
+                for measurement in scan_generator:
+                    # PyRPlidarMeasurement has dict-like string representation
+                    # Parse the measurement data
+                    meas_str = str(measurement)
+                    
+                    # Extract values using string parsing (simple approach)
+                    # Format: "{'start_flag': False, 'quality': 188, 'angle': 353.421875, 'distance': 1136.0}"
+                    try:
+                        # Simple parsing
+                        start_flag = 'True' in meas_str.split("'start_flag': ")[1].split(',')[0]
+                        quality = int(meas_str.split("'quality': ")[1].split(',')[0])
+                        angle = float(meas_str.split("'angle': ")[1].split(',')[0])
+                        distance = float(meas_str.split("'distance': ")[1].split('}')[0])
+                    except:
+                        continue  # Skip malformed data
+                    
+                    # If we see a start flag and we've already started collecting, we have a complete scan
+                    if start_flag and scan_started:
+                        break
+                    
+                    if start_flag:
+                        scan_started = True
+                    
+                    # Collect valid points
+                    if distance > 0 and distance < MAX_DISTANCE and quality > 0:
+                        scan_points.append((angle, distance))
+                    
+                    # Safety: if we have too many points, break
+                    if len(scan_points) > 10000:
+                        break
+                
+                # Draw all collected points
+                valid_points = 0
+                for angle, distance in scan_points:
+                    # Convert polar coordinates to Cartesian
+                    angle_rad = math.radians(angle)
+                    
+                    # Calculate x, y coordinates (invert y for image coordinates)
+                    x = int(CENTER + (distance / SCALE) * math.cos(angle_rad))
+                    y = int(CENTER - (distance / SCALE) * math.sin(angle_rad))
+                    
+                    # Draw point if within image bounds
+                    if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
+                        cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
+                        valid_points += 1
+                
+                # Add text information
+                cv2.putText(image, f"Frame: {frame_count}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                cv2.putText(image, f"Points: {valid_points}", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                cv2.putText(image, "Press 'q' to quit", (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                
+                # Display the image
+                cv2.imshow('LIDAR Scan', image)
+                
+                frame_count += 1
+                
+                # Break loop if 'q' is pressed
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        except KeyboardInterrupt:
+            self.lidar_port_ok = False
+
+            print("\nStopping...")
+        except Exception as e:
+            self.lidar_port_ok = False
+
+            print(f"\nError occurred: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.lidar_port_ok = False
+
+            # Cleanup
+            print("Cleaning up...")
+            lidar.set_motor_pwm(0)
+            lidar.stop()
+            lidar.disconnect()
+            cv2.destroyAllWindows()
+            print("LIDAR disconnected and cleanup complete")
 
 
 
