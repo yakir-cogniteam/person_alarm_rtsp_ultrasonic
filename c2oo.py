@@ -44,6 +44,11 @@ class PersonAlarmManager:
         self.lidar_target_deg = None
         self.is_map_calibrated = False
         self.calibration_cmd = False
+        self.is_calibration_active = False
+        self.calibration_count = 0
+        self.MAX_CALIBRATION_COUNT = 100      
+
+
         self.system_state = 'auto' # auto / manual
         self.rotating_to_target_active = False
         self.wanted_pan = None
@@ -524,26 +529,7 @@ class PersonAlarmManager:
     
     def _lidar_thread(self):
 
-        # lidar_strat_time = time.time()
-
-        # send_cmd = False
-        # if self.lidar_port_ok:
-        #     while self.running:
-                
-        #         elapsed = time.time() - lidar_strat_time
-
-        #         if self.calibration_cmd == True:
-        #             self.calibration_cmd = False
-
-        #             self.is_map_calibrated = True
-        #             print('caliration cmd recived !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11')
-        #         # if (elapsed > 30 and send_cmd == False):
-        #         #     send_cmd = True
-
-        #         #     self.lidar_target_deg = -100                  
-
-
-        #         time.sleep(0.01)  # Brief pause on failure
+        
 
         from pyrplidar import PyRPlidar
         import cv2
@@ -655,14 +641,28 @@ class PersonAlarmManager:
                         break
                 
                 # Draw all collected points
+
+                if  self.calibration_cmd == True:
+                    self.calibration_cmd = False
+                    self.is_map_calibrated = False
+                    self.is_calibration_active = True
+
+
+               
+
                 valid_points = 0
                 for angle, distance in scan_points:
                     # Convert polar coordinates to Cartesian
                     angle_rad = math.radians(angle)
                     
+                    
                     # Calculate x, y coordinates (invert y for image coordinates)
                     x = int(CENTER + (distance / SCALE) * math.cos(angle_rad))
                     y = int(CENTER - (distance / SCALE) * math.sin(angle_rad))
+
+                    real_x = float(distance * math.cos(angle_rad))
+                    real_y = float(distance * math.sin(angle_rad))
+
                     
                     # Draw point if within image bounds
                     if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
@@ -681,6 +681,14 @@ class PersonAlarmManager:
                 cv2.imshow('LIDAR Scan', image)
                 
                 frame_count += 1
+
+                if self.is_calibration_active:
+                    self.calibration_count += 1
+
+                    if self.calibration_count > self.MAX_CALIBRATION_COUNT:
+                        self.calibration_count = 0
+                        self.is_calibration_active = False
+                        self.is_map_calibrated = True
                 
                 # Break loop if 'q' is pressed
                 if cv2.waitKey(1) & 0xFF == ord('q'):
