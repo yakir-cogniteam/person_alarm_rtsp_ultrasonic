@@ -11,12 +11,14 @@ import pyaudio
 import wave
 import math
 import paho.mqtt.client as mqtt
+from scipy.spatial import KDTree
 
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
                  pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
-                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status"):
+                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status",
+                 motion_threshold=0.5):
 
         #"/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic
         self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -47,6 +49,12 @@ class PersonAlarmManager:
         self.is_calibration_active = False
         self.calibration_count = 0
         self.MAX_CALIBRATION_COUNT = 100      
+
+        # NEW: KDTree and motion detection members
+        self.calibration_points = []  # List to store 2D points during calibration
+        self.kdtree = None  # KDTree structure for fast nearest neighbor queries
+        self.motion_threshold = motion_threshold  # Distance threshold in meters (e.g., 0.5)
+        self.motion_points = []  # List to store detected motion points in current frame      
 
 
         self.system_state = 'auto' # auto / manual
@@ -227,6 +235,83 @@ class PersonAlarmManager:
             self.system_state = 'manual'
 
         print(f' the state now is {self.system_state}')    
+    
+    def _build_kdtree(self):
+        """Build KDTree from collected calibration points"""
+        if len(self.calibration_points) == 0:
+            print("⚠️  No calibration points to build KDTree")
+            return False
+        
+        try:
+            # Convert list of points to numpy array
+            points_array = np.array(self.calibration_points)
+            self.kdtree = KDTree(points_array)
+            print(f"✅ KDTree built with {len(self.calibration_points)} points")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to build KDTree: {e}")
+            return False
+    
+    def get_distance_to_nearest_point(self, real_x, real_y):
+        """
+        Query the KDTree to find the distance to the nearest calibration point
+        
+        Args:
+            real_x: X coordinate of the query point (meters)
+            real_y: Y coordinate of the query point (meters)
+            
+        Returns:
+            distance: Distance to nearest point (meters), or None if KDTree not available
+        """
+        if self.kdtree is None:
+            return None
+        
+        try:
+            query_point = np.array([real_x, real_y])
+            distance, index = self.kdtree.query(query_point)
+            return distance
+        except Exception as e:
+            print(f"❌ Error querying KDTree: {e}")
+            return None
+    
+    def collect_motion_points(self, scan_points):
+        """
+        Collect all 2D points from scan that are above the motion threshold
+        
+        Args:
+            scan_points: List of (real_x, real_y) tuples from the current scan
+            
+        Returns:
+            motion_points: List of (real_x, real_y) tuples that exceed threshold
+        """
+        if not self.is_map_calibrated or self.kdtree is None:
+            return []
+        
+        motion_points = []
+        for real_x, real_y in scan_points:
+            distance = self.get_distance_to_nearest_point(real_x, real_y)
+            if distance is not None and distance > self.motion_threshold:
+                motion_points.append((real_x, real_y))
+        
+        return motion_points
+    
+    def draw_motion_points(self, frame, motion_points, pixel_coords):
+        """
+        Draw motion points as red circles on the frame
+        
+        Args:
+            frame: OpenCV image frame
+            motion_points: List of (real_x, real_y) tuples representing motion
+            pixel_coords: List of corresponding (pixel_x, pixel_y) tuples for drawing
+        """
+        for i, (real_x, real_y) in enumerate(motion_points):
+            if i < len(pixel_coords):
+                px, py = pixel_coords[i]
+                # Draw red circle for motion point
+                cv2.circle(frame, (int(px), int(py)), 5, (0, 0, 255), -1)
+                # Optionally add a small label
+                cv2.putText(frame, f"M", (int(px) + 8, int(py)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)    
     
     def play_beep(self):
         
@@ -646,28 +731,91 @@ class PersonAlarmManager:
                     self.calibration_cmd = False
                     self.is_map_calibrated = False
                     self.is_calibration_active = True
-
+                    self.calibration_points = []  # Reset calibration points
+                    self.calibration_count = 0
 
                
+                # Collect 2D real-world coordinates and pixel coordinates
+                scan_real_points = []  # (real_x, real_y) in mm
+                scan_pixel_coords = []  # (px, py) for drawing
 
                 valid_points = 0
                 for angle, distance in scan_points:
                     # Convert polar coordinates to Cartesian
                     angle_rad = math.radians(angle)
                     
-                    
+                   
                     # Calculate x, y coordinates (invert y for image coordinates)
                     x = int(CENTER + (distance / SCALE) * math.cos(angle_rad))
                     y = int(CENTER - (distance / SCALE) * math.sin(angle_rad))
 
-                    real_x = float(distance * math.cos(angle_rad))
-                    real_y = float(distance * math.sin(angle_rad))
+                    real_x = float( (distance/1000.0) * math.cos(angle_rad)) 
+                    real_y = float( (distance/1000.0) * math.sin(angle_rad)) 
 
+                    # print(f' the distnace is {distance} real_x {real_x} real_y {real_y} ')
+                    # Store real-world coordinates
+                    scan_real_points.append((real_x, real_y))
                     
                     # Draw point if within image bounds
                     if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
+                        scan_pixel_coords.append((x, y))
                         cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
                         valid_points += 1
+                    else:
+                        scan_pixel_coords.append(None)  # Mark as out of bounds
+                
+                # CALIBRATION: Collect points during calibration phase
+                if self.is_calibration_active:
+                    for real_x, real_y in scan_real_points:
+                        self.calibration_points.append([real_x, real_y])
+                    
+                    self.calibration_count += 1
+                    
+                    # Display calibration progress
+                    calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
+                    cv2.putText(image, calib_text, (10, 120),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    
+                    if self.calibration_count >= self.MAX_CALIBRATION_COUNT:
+                        self.is_calibration_active = False
+                        self.is_map_calibrated = self._build_kdtree()
+                        print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
+                
+                # MOTION DETECTION: After calibration, detect motion points
+                if self.is_map_calibrated and self.rotating_to_target_active == False:
+                    self.motion_points = self.collect_motion_points(scan_real_points)
+                    
+                    # Draw motion points as red circles
+                    motion_count = 0
+                    for i, (real_x, real_y) in enumerate(self.motion_points):
+                        if i < len(scan_pixel_coords):
+                            # Find corresponding pixel coordinate
+                            for j, (rx, ry) in enumerate(scan_real_points):
+                                if abs(rx - real_x) < 0.1 and abs(ry - real_y) < 0.1:
+                                    if j < len(scan_pixel_coords) and scan_pixel_coords[j] is not None:
+                                        px, py = scan_pixel_coords[j]
+                                        cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
+                                        motion_count += 1
+                                    break
+                    
+                    # Display motion detection info
+                    if motion_count > 0:
+                        motion_text = f"MOTION: {motion_count} points"
+                        cv2.putText(image, motion_text, (10, 120),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                        # If significant motion detected, trigger alarm logic
+                        if motion_count > 10:  # Threshold for significant motion
+                            # Find the angle of the centroid of motion points
+                            motion_angles = []
+                            for real_x, real_y in self.motion_points:
+                                angle_to_point = math.degrees(math.atan2(real_y, real_x))
+                                motion_angles.append(angle_to_point)
+                            
+                            if len(motion_angles) > 0:
+                                avg_angle = sum(motion_angles) / len(motion_angles)
+                                self.lidar_target_deg = avg_angle
+                                print(f"🎯 Motion detected at angle: {avg_angle:.1f}°")
                 
                 # Add text information
                 cv2.putText(image, f"Frame: {frame_count}", (10, 30),
@@ -681,14 +829,6 @@ class PersonAlarmManager:
                 cv2.imshow('LIDAR Scan', image)
                 
                 frame_count += 1
-
-                if self.is_calibration_active:
-                    self.calibration_count += 1
-
-                    if self.calibration_count > self.MAX_CALIBRATION_COUNT:
-                        self.calibration_count = 0
-                        self.is_calibration_active = False
-                        self.is_map_calibrated = True
                 
                 # Break loop if 'q' is pressed
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1065,7 +1205,8 @@ class PersonAlarmManager:
             
 
             if self.rotating_to_target_active:
-                
+                self.lidar_target_deg = None
+
                 pan, tilt, zoom = self.get_current_ptz()
                 
                 if math.fabs(self.wanted_pan - pan) < 0.05:
@@ -1100,11 +1241,11 @@ class PersonAlarmManager:
                         self.go_home()
 
                     else:
-
+                        self.rotating_to_target_active = False    
                         print(' noooo person no person !!!!!') 
                         self.go_home() 
                 
-            if self.lidar_target_deg != None:
+            elif self.lidar_target_deg != None:
 
                 self.rotate_to_target(self.lidar_target_deg)
                 self.lidar_target_deg = None
@@ -1204,6 +1345,8 @@ def main():
     ENABLE_DETECTION = True      # Set to False to disable person detection
     DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
     
+    # Motion detection settings
+    MOTION_THRESHOLD = 0.5 # Distance in meters (500mm) to consider as motion
  
     # Create manager instance
     manager = PersonAlarmManager(
@@ -1217,7 +1360,8 @@ def main():
         mqtt_broker=MQTT_BROKER,
         mqtt_port=MQTT_PORT,
         mqtt_topic=MQTT_TOPIC,
-        mqtt_status_topic=MQTT_STATUS_TOPIC
+        mqtt_status_topic=MQTT_STATUS_TOPIC,
+        motion_threshold=MOTION_THRESHOLD
     ) 
     
     try:
