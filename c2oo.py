@@ -233,6 +233,7 @@ class PersonAlarmManager:
             self.system_state = 'auto'
         elif self.system_state == 'auto':
             self.system_state = 'manual'
+            
 
         print(f' the state now is {self.system_state}')    
     
@@ -658,7 +659,7 @@ class PersonAlarmManager:
         # Visualization parameters
         IMAGE_SIZE = 800  # Size of the display window
         CENTER = IMAGE_SIZE // 2  # Center point of the image
-        SCALE = 5  # Scale factor (pixels per mm) - adjusted for 3m range
+        SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
         MAX_DISTANCE = 3500  # Maximum distance in mm to display
 
         # Start scanning with mode 2 (Boost)
@@ -676,19 +677,7 @@ class PersonAlarmManager:
                 # Create a white image
                 image = np.ones((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8) * 255
                 
-                # Draw center point (LIDAR position)
-                cv2.circle(image, (CENTER, CENTER), 5, (0, 0, 255), -1)
-                
-                # Draw distance circles for reference (every 500mm)
-                for dist in range(500, MAX_DISTANCE, 500):
-                    radius = int(dist / SCALE)
-                    if radius < CENTER:
-                        cv2.circle(image, (CENTER, CENTER), radius, (200, 200, 200), 1)
-                        # Add distance labels
-                        if dist % 1000 == 0:
-                            label = f"{dist//1000}m"
-                            cv2.putText(image, label, (CENTER + radius - 20, CENTER - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+               
                 
                 # Collect points for one complete scan (360 degrees)
                 scan_points = []
@@ -765,7 +754,7 @@ class PersonAlarmManager:
                         scan_pixel_coords.append(None)  # Mark as out of bounds
                 
                 # CALIBRATION: Collect points during calibration phase
-                if self.is_calibration_active:
+                if self.is_calibration_active :
                     for real_x, real_y in scan_real_points:
                         self.calibration_points.append([real_x, real_y])
                     
@@ -782,7 +771,7 @@ class PersonAlarmManager:
                         print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
                 
                 # MOTION DETECTION: After calibration, detect motion points
-                if self.is_map_calibrated and self.rotating_to_target_active == False:
+                if self.is_map_calibrated and self.rotating_to_target_active == False and self.system_state == 'auto':
                     self.motion_points = self.collect_motion_points(scan_real_points)
                     
                     # Draw motion points as red circles
@@ -1252,7 +1241,15 @@ class PersonAlarmManager:
                 self.rotating_to_target_active = True
                 
 
-               
+            if self.system_state == 'manual' and self.rotating_to_target_active:
+                self.enable_detection = False
+                self.detection_active = False
+                self.rotating_to_target_active = False   
+
+                self.go_home()
+
+          
+
 
             
             # Add overlay information
