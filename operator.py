@@ -15,6 +15,7 @@ import math
 class Operator:
     def __init__(self, mqtt_broker="localhost", mqtt_port=1883, 
                  mqtt_topic="camera/control", mqtt_status_topic="camera/status",
+                 mqtt_lidar_topic="lidar/scan",  # NEW: LiDAR scan topic
                  rtsp_url=None):
         """
         Initialize the Operator interface
@@ -24,12 +25,14 @@ class Operator:
             mqtt_port: MQTT broker port
             mqtt_topic: Topic to publish control commands
             mqtt_status_topic: Topic to subscribe for status updates
+            mqtt_lidar_topic: Topic to subscribe for LiDAR scan data
             rtsp_url: RTSP stream URL from the camera
         """
         self.mqtt_broker = mqtt_broker
         self.mqtt_port = mqtt_port
         self.mqtt_topic = mqtt_topic
         self.mqtt_status_topic = mqtt_status_topic
+        self.mqtt_lidar_topic = mqtt_lidar_topic  # NEW
         self.rtsp_url = rtsp_url
         
         # MQTT client
@@ -42,11 +45,15 @@ class Operator:
         self.latest_frame = None
         self.frame_lock = threading.Lock()
         
-        # NEW: Status dictionary from camera
+        # Status dictionary from camera
         self.status_dict = {}
         self.status_lock = threading.Lock()
         
-        # NEW: View mode toggle
+        # NEW: LiDAR scan data
+        self.latest_lidar_scan = None
+        self.lidar_scan_lock = threading.Lock()
+        
+        # View mode toggle
         self.view_mode = "rtsp"  # "rtsp" or "map"
         
         # Map visualization parameters
@@ -103,7 +110,7 @@ class Operator:
             'bd': 3
         }
         
-        # NEW: View Mode Toggle button
+        # View Mode Toggle button
         self.view_mode_btn = tk.Button(
             left_panel,
             text="View Mode: RTSP",
@@ -210,7 +217,7 @@ class Operator:
         )
         self.video_info_label.place(relx=0.5, rely=0.5, anchor='center')
         
-        # NEW: Right panel for status indicators
+        # Right panel for status indicators
         right_panel = tk.Frame(self.root, bg='#34495e', padx=10, pady=10, width=200)
         right_panel.grid(row=0, column=2, sticky='nsew')
         right_panel.grid_propagate(False)  # Prevent frame from shrinking
@@ -384,6 +391,10 @@ class Operator:
             # Subscribe to status topic
             self.mqtt_client.subscribe(self.mqtt_status_topic)
             print(f"📡 Subscribed to status topic: {self.mqtt_status_topic}")
+            
+            # Subscribe to LiDAR scan topic
+            self.mqtt_client.subscribe(self.mqtt_lidar_topic)
+            print(f"📡 Subscribed to LiDAR topic: {self.mqtt_lidar_topic}")
         else:
             print(f"❌ Failed to connect to MQTT broker. Code: {rc}")
             self.mqtt_connected = False
@@ -402,17 +413,24 @@ class Operator:
             if msg.topic == self.mqtt_status_topic:
                 # Parse JSON status dictionary
                 status_json = msg.payload.decode('utf-8')
-                # print(f' status_json: { status_json }')
                 status_dict = json.loads(status_json)
                 
                 # Update local status dictionary
                 with self.status_lock:
                     self.status_dict = status_dict
+            
+            # NEW: Check if this is a LiDAR scan message
+            elif msg.topic == self.mqtt_lidar_topic:
+                # Parse JSON scan data
+                scan_json = msg.payload.decode('utf-8')
+                scan_dict = json.loads(scan_json)
                 
-                # print(f"📥 Received status update: {status_dict}")
+                # Update latest LiDAR scan
+                with self.lidar_scan_lock:
+                    self.latest_lidar_scan = scan_dict
                 
         except json.JSONDecodeError as e:
-            print(f"❌ Failed to parse status JSON: {e}")
+            print(f"❌ Failed to parse JSON: {e}")
         except Exception as e:
             print(f"❌ Error processing MQTT message: {e}")
         
@@ -447,7 +465,7 @@ class Operator:
     
     def _draw_map_view(self):
         """
-        Generate map view image from static map points and clusters
+        Generate map view image from LiDAR scan, static map points, and clusters
         
         Returns:
             numpy array: Image with map visualization
@@ -455,10 +473,17 @@ class Operator:
         # Create white background
         image = np.ones((self.map_image_size, self.map_image_size, 3), dtype=np.uint8) * 255
         
+        # Get status and scan data
         with self.status_lock:
             status = self.status_dict.copy()
         
-        # Draw static map points (black dots)
+        with self.lidar_scan_lock:
+            lidar_scan = self.latest_lidar_scan
+        
+        # Draw grid (optional - uncomment if you want)
+        # self._draw_grid(image)
+        
+        # LAYER 1: Draw static calibration map points (LIGHT GRAY - background)
         if 'static_map_points' in status and len(status['static_map_points']) > 0:
             for point in status['static_map_points']:
                 x = point['x']
@@ -470,9 +495,24 @@ class Operator:
                 
                 # Draw if within bounds
                 if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
-                    cv2.circle(image, (px, py), 2, (0, 0, 0), -1)
+                    cv2.circle(image, (px, py), 2, (200, 200, 200), -1)  # Light gray
         
-        # Draw clusters
+        # LAYER 2: Draw current LiDAR scan points (BLUE - live data)
+        if lidar_scan and 'points' in lidar_scan:
+            points = lidar_scan['points']
+            for point in points:
+                x = point['x']
+                y = point['y']
+                
+                # Convert to pixel coordinates
+                px = int(self.map_center + x * self.map_scale)
+                py = int(self.map_center - y * self.map_scale)
+                
+                # Draw if within bounds
+                if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
+                    cv2.circle(image, (px, py), 3, (255, 128, 0), -1)  # Orange/Blue
+        
+        # LAYER 3: Draw motion clusters (RED for closest, PURPLE for others)
         if 'clusters' in status and len(status['clusters']) > 0:
             for i, cluster in enumerate(status['clusters']):
                 # First cluster (closest to origin) in RED, others in PURPLE
@@ -495,7 +535,7 @@ class Operator:
                         
                         # Draw if within bounds
                         if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
-                            cv2.circle(image, (px, py), 4, cluster_color, -1)
+                            cv2.circle(image, (px, py), 5, cluster_color, -1)
                 
                 # Draw cluster center with larger circle
                 if 'center' in cluster:
@@ -509,13 +549,13 @@ class Operator:
                     # Draw if within bounds
                     if 0 <= cpx < self.map_image_size and 0 <= cpy < self.map_image_size:
                         # Draw center marker
-                        cv2.circle(image, (cpx, cpy), 10, center_color, 2)
-                        cv2.circle(image, (cpx, cpy), 3, center_color, -1)
+                        cv2.circle(image, (cpx, cpy), 12, center_color, 2)
+                        cv2.circle(image, (cpx, cpy), 4, center_color, -1)
                         
                         # Add label
                         label = f"C{i+1}"
                         cv2.putText(image, label, (cpx + 15, cpy - 15),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, center_color, 2)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, center_color, 2)
         
         # Draw origin marker (0, 0)
         cv2.drawMarker(image, (self.map_center, self.map_center), 
@@ -535,17 +575,36 @@ class Operator:
         cv2.putText(image, "Legend:", (10, legend_y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
         
-        cv2.circle(image, (20, legend_y + 25), 3, (0, 0, 0), -1)
-        cv2.putText(image, "Static Map", (35, legend_y + 30),
+        # Static map
+        cv2.circle(image, (20, legend_y + 25), 3, (200, 200, 200), -1)
+        cv2.putText(image, "Static Map (Calibration)", (35, legend_y + 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        cv2.circle(image, (20, legend_y + 50), 5, (0, 0, 255), -1)
-        cv2.putText(image, "Cluster 1 (Closest)", (35, legend_y + 55),
+        # Current scan
+        cv2.circle(image, (20, legend_y + 50), 3, (255, 128, 0), -1)
+        cv2.putText(image, "Current Scan (Live)", (35, legend_y + 55),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # Cluster 1
+        cv2.circle(image, (20, legend_y + 75), 5, (0, 0, 255), -1)
+        cv2.putText(image, "Motion Cluster (Closest)", (35, legend_y + 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
-        cv2.circle(image, (20, legend_y + 75), 5, (255, 0, 255), -1)
-        cv2.putText(image, "Other Clusters", (35, legend_y + 80),
+        # Other clusters
+        cv2.circle(image, (20, legend_y + 100), 5, (255, 0, 255), -1)
+        cv2.putText(image, "Other Motion Clusters", (35, legend_y + 105),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        
+        # Display scan info if available
+        if lidar_scan:
+            info_y = self.map_image_size - 80
+            scan_num = lidar_scan.get('scan_number', 0)
+            point_count = lidar_scan.get('point_count', 0)
+            
+            cv2.putText(image, f"Scan #{scan_num}", (10, info_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            cv2.putText(image, f"Points: {point_count}", (10, info_y + 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
         
         return image
             
@@ -666,10 +725,11 @@ class Operator:
 
 def main():
     # Configuration
-    MQTT_BROKER = '192.168.1.122' #"localhost"  # Change to your MQTT broker address
+    MQTT_BROKER = '192.168.1.122'  # Change to your MQTT broker address
     MQTT_PORT = 1883
     MQTT_TOPIC = "camera/control"
-    MQTT_STATUS_TOPIC = "camera/status"  # NEW: Status topic
+    MQTT_STATUS_TOPIC = "camera/status"
+    MQTT_LIDAR_TOPIC = "lidar/scan"  # NEW: LiDAR scan topic
     
     # RTSP URL (same as PersonAlarmManager uses)
     # Update with your camera's RTSP URL
@@ -681,6 +741,7 @@ def main():
         mqtt_port=MQTT_PORT,
         mqtt_topic=MQTT_TOPIC,
         mqtt_status_topic=MQTT_STATUS_TOPIC,
+        mqtt_lidar_topic=MQTT_LIDAR_TOPIC,  # NEW
         rtsp_url=RTSP_URL
     )
     

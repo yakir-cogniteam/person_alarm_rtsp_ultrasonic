@@ -12,18 +12,14 @@ import wave
 import math
 import paho.mqtt.client as mqtt
 from scipy.spatial import KDTree
-from pyrplidar import PyRPlidar
-import cv2
-import numpy as np
-import math
-import time
-from sklearn.cluster import DBSCAN
 import json
+from sklearn.cluster import DBSCAN
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
                  pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
-                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status",
+                 mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", 
+                 mqtt_status_topic="camera/status", mqtt_lidar_topic="lidar/scan",
                  motion_threshold=0.5, clustering_max_distance=0.2):
 
         self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
@@ -34,8 +30,10 @@ class PersonAlarmManager:
         self.mqtt_port = mqtt_port
         self.mqtt_topic = mqtt_topic
         self.mqtt_status_topic = mqtt_status_topic
+        self.mqtt_lidar_topic = mqtt_lidar_topic  # NEW: Topic to receive LiDAR scans
         self.mqtt_client = None
         self.mqtt_connected = False
+        
         self.camera_ip = camera_ip
         self.username = username
         self.password = password
@@ -46,7 +44,7 @@ class PersonAlarmManager:
         self.imaging_service = None
         self.stream_url = None
         self.video_capture = None
-        self.lidar_port_ok = True
+        self.lidar_port_ok = True  # Will be set based on receiving scan data
         self.running = False
 
         self.lidar_target_deg = None
@@ -66,14 +64,11 @@ class PersonAlarmManager:
         self.clustering_max_distance = clustering_max_distance  # Max distance between points in same cluster
         self.detected_clusters = []  # List of detected clusters with their centers and points
         
-        # lidar debug
-        self.lidar_debug_image = True
-        self.IMAGE_SIZE = None  # Size of the display window
-        self.CENTER = None  # Center point of the image
-        self.SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
-        self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
-        self.count_debug = 0
-
+        # NEW: LiDAR scan data from MQTT
+        self.latest_scan = None
+        self.scan_lock = threading.Lock()
+        self.last_scan_time = 0
+        self.scan_timeout = 5.0  # Seconds - if no scan received, set lidar_port_ok to False
 
         self.system_state = 'auto' # auto / manual
         self.rotating_to_target_active = False
@@ -127,6 +122,8 @@ class PersonAlarmManager:
         self.last_beep_time = 0
         self.beep_cooldown = 2.0  # Minimum seconds between beeps
         
+        # NEW: LiDAR processing thread
+        self.lidar_processing_thread = None
         
         # Initialize detector if enabled
         if self.enable_detection:
@@ -137,25 +134,42 @@ class PersonAlarmManager:
         """Clean up and disconnect"""
         print("🛑 Stopping all threads...")
         self.running = False
-        self.lidar_running = False  # Signal LIDAR thread to stop
         
-        # Wait for LIDAR thread to stop
-        if hasattr(self, 'lidar_thread') and self.lidar_thread and self.lidar_thread.is_alive():
-            print("Waiting for LIDAR thread to stop...")
-            self.lidar_thread.join(timeout=5.0)
+        # Wait for LiDAR processing thread to stop
+        if self.lidar_processing_thread and self.lidar_processing_thread.is_alive():
+            print("Waiting for LiDAR processing thread to stop...")
+            self.lidar_processing_thread.join(timeout=5.0)
         
-        # ... rest of the disconnect code ...
+        # Stop MQTT client
+        if self.mqtt_client:
+            print("Disconnecting MQTT client...")
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+        
+        # Wait for capture thread to stop
+        if self.capture_thread and self.capture_thread.is_alive():
+            print("Waiting for capture thread to stop...")
+            self.capture_thread.join(timeout=2.0)
+        
+        # Wait for any pending PTZ commands to complete
+        if self.ptz_thread and self.ptz_thread.is_alive():
+            print("Waiting for PTZ command to complete...")
+            self.ptz_thread.join(timeout=2.0)
+        
+        if self.video_capture:
+            self.video_capture.release()
+        
+        cv2.destroyAllWindows()
+        print("Disconnected from camera")
 
     def _init_person_detector(self):
         """Initialize MobileNet SSD person detector (optimized for Raspberry Pi)"""
         try:
             print("Initializing person detector (MobileNet SSD)...")
             
-
             prototxt_path = self.ws_path + "/model/MobileNetSSD_deploy.prototxt"
             model_path = self.ws_path + "/model/MobileNetSSD_deploy.caffemodel"
            
-            
             # Load the MobileNet SSD model
             self.net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
             
@@ -174,7 +188,7 @@ class PersonAlarmManager:
             return False
     
     def _setup_mqtt(self):
-        """Setup MQTT client for receiving commands"""
+        """Setup MQTT client for receiving commands and LiDAR scans"""
         try:
             self.mqtt_client = mqtt.Client(client_id="camera_c200")
             self.mqtt_client.on_connect = self._on_mqtt_connect
@@ -194,9 +208,14 @@ class PersonAlarmManager:
         if rc == 0:
             print("✅ Connected to MQTT broker")
             self.mqtt_connected = True
-            # Subscribe to the control topic
+            
+            # Subscribe to control topic
             self.mqtt_client.subscribe(self.mqtt_topic)
             print(f"📡 Subscribed to topic: {self.mqtt_topic}")
+            
+            # Subscribe to LiDAR scan topic
+            self.mqtt_client.subscribe(self.mqtt_lidar_topic)
+            print(f"📡 Subscribed to LiDAR topic: {self.mqtt_lidar_topic}")
         else:
             print(f"❌ Failed to connect to MQTT broker. Code: {rc}")
             self.mqtt_connected = False
@@ -207,10 +226,14 @@ class PersonAlarmManager:
         self.mqtt_connected = False
     
     def _on_mqtt_message(self, client, userdata, msg):
-        
-        
         """Callback for receiving MQTT messages"""
         try:
+            # Check if this is a LiDAR scan message
+            if msg.topic == self.mqtt_lidar_topic:
+                self._process_lidar_scan(msg)
+                return
+            
+            # Otherwise, it's a control command
             command = msg.payload.decode('utf-8')
             print(f"📥 Received command: {command}")
 
@@ -240,20 +263,132 @@ class PersonAlarmManager:
         except Exception as e:
             print(f"❌ Error processing MQTT message: {e}")
     
+    def _process_lidar_scan(self, msg):
+        """
+        Process incoming LiDAR scan data from MQTT
+        
+        Args:
+            msg: MQTT message containing scan data
+        """
+        try:
+            # Parse JSON scan data
+            scan_json = msg.payload.decode('utf-8')
+            scan_data = json.loads(scan_json)
+            
+            # Update latest scan
+            with self.scan_lock:
+                self.latest_scan = scan_data
+                self.last_scan_time = time.time()
+                self.lidar_port_ok = True  # We're receiving data, so LiDAR is OK
+            
+            # Trigger processing in separate thread to avoid blocking MQTT callback
+            if self.running:
+                # Process scan data (non-blocking)
+                processing_thread = threading.Thread(
+                    target=self._process_scan_data,
+                    args=(scan_data,)
+                )
+                processing_thread.daemon = True
+                processing_thread.start()
+                
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse LiDAR scan JSON: {e}")
+        except Exception as e:
+            print(f"❌ Error processing LiDAR scan: {e}")
+    
+    def _process_scan_data(self, scan_data):
+        """
+        Process LiDAR scan data (same logic as the original _lidar_thread)
+        
+        Args:
+            scan_data: Dictionary containing scan points and metadata
+        """
+        try:
+            # Extract points from scan data
+            points = scan_data.get('points', [])
+            
+            if len(points) < 50:
+                # Incomplete scan, skip processing
+                return
+            
+            # Convert points to (real_x, real_y) tuples
+            scan_real_points = []
+            for point in points:
+                real_x = point['x']  # Already in meters
+                real_y = point['y']  # Already in meters
+                scan_real_points.append((real_x, real_y))
+            
+            # CALIBRATION: Collect points during calibration phase
+            if self.calibration_cmd:
+                self.calibration_cmd = False
+                self.is_map_calibrated = False
+                self.is_calibration_active = True
+                self.calibration_points = []  # Reset calibration points
+                self.calibration_count = 0
+            
+            if self.is_calibration_active:
+                for real_x, real_y in scan_real_points:
+                    self.calibration_points.append([real_x, real_y])
+                
+                self.calibration_count += 1
+                print(f'📊 Calibration count: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}')
+                
+                if self.calibration_count >= self.MAX_CALIBRATION_COUNT:
+                    self.is_calibration_active = False
+                    self.is_map_calibrated = self._build_kdtree()
+                    print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
+            
+            # MOTION DETECTION: After calibration, detect motion points
+            if self.is_map_calibrated and not self.rotating_to_target_active and self.system_state == 'auto':
+                self.motion_points = self.collect_motion_points(scan_real_points)
+                
+                # Cluster the motion points
+                self.detected_clusters = self.cluster_motion_points(self.motion_points)
+                
+                if len(self.detected_clusters) > 0:
+                    # Get the closest cluster (already sorted by distance to origin)
+                    closest_cluster = self.detected_clusters[0]
+                    center_x, center_y = closest_cluster['center']
+                    points_cluster = closest_cluster['points']
+                    
+                    if len(points_cluster) > 5:
+                        # Calculate angle to closest cluster center
+                        angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
+                        self.lidar_target_deg = angle_to_cluster
+                        print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° "
+                              f"(distance: {closest_cluster['distance_to_origin']:.2f}m, "
+                              f"points: {len(points_cluster)})")
+                
+        except Exception as e:
+            print(f"❌ Error processing scan data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _check_lidar_timeout(self):
+        """Check if LiDAR data is timing out"""
+        while self.running:
+            current_time = time.time()
+            
+            with self.scan_lock:
+                if self.last_scan_time > 0:
+                    elapsed = current_time - self.last_scan_time
+                    if elapsed > self.scan_timeout:
+                        if self.lidar_port_ok:
+                            print(f"⚠️  No LiDAR data received for {elapsed:.1f}s - marking as not OK")
+                            self.lidar_port_ok = False
+            
+            time.sleep(1.0)  # Check every second
     
     def sound_test(self):
-
         self.play_beep()
     
     def switch_state(self):
-
         if self.system_state == 'manual':
             self.system_state = 'auto'
         elif self.system_state == 'auto':
             self.system_state = 'manual'
-            
-
-        print(f' the state now is {self.system_state}')    
+        
+        print(f'🔄 System state changed to: {self.system_state}')    
     
     def _build_kdtree(self):
         """Build KDTree from collected calibration points"""
@@ -371,7 +506,8 @@ class PersonAlarmManager:
             # Sort clusters by distance to origin (closest first)
             clusters.sort(key=lambda c: c['distance_to_origin'])
             
-            print(f"🔍 Found {len(clusters)} clusters from {len(motion_points)} motion points")
+            if len(clusters) > 0:
+                print(f"🔍 Found {len(clusters)} clusters from {len(motion_points)} motion points")
             
             return clusters
             
@@ -379,26 +515,7 @@ class PersonAlarmManager:
             print(f"❌ Error clustering motion points: {e}")
             return []
     
-    def draw_motion_points(self, frame, motion_points, pixel_coords):
-        """
-        Draw motion points as red circles on the frame
-        
-        Args:
-            frame: OpenCV image frame
-            motion_points: List of (real_x, real_y) tuples representing motion
-            pixel_coords: List of corresponding (pixel_x, pixel_y) tuples for drawing
-        """
-        for i, (real_x, real_y) in enumerate(motion_points):
-            if i < len(pixel_coords):
-                px, py = pixel_coords[i]
-                # Draw red circle for motion point
-                cv2.circle(frame, (int(px), int(py)), 5, (0, 0, 255), -1)
-                # Optionally add a small label
-                cv2.putText(frame, f"M", (int(px) + 8, int(py)), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)    
-    
     def play_beep(self):
-        
         file_path = self.ws_path + "/sounds/beep.wav"
     
         try:
@@ -418,7 +535,7 @@ class PersonAlarmManager:
             chunk_size = 1024
             data = wf.readframes(chunk_size)
             
-            print(f"🔊 Playing: {file_path}")
+            print(f"🔊 Playing beep")
             
             while data:
                 stream.write(data)
@@ -430,13 +547,10 @@ class PersonAlarmManager:
             p.terminate()
             wf.close()
             
-            print("✅ Playback finished")
-            
         except FileNotFoundError:
             print(f"❌ Error: File '{file_path}' not found")
         except Exception as e:
             print(f"❌ Error playing audio: {e}")
-       
     
     def _detect_persons(self, frame):
         """
@@ -492,48 +606,6 @@ class PersonAlarmManager:
             print(f"Error in person detection: {e}")
             return []
     
-    def _draw_detections(self, frame, detections):
-        """
-        Draw detection boxes on frame
-        
-        Args:
-            frame: Input frame
-            detections: List of (confidence, x1, y1, x2, y2) tuples
-            
-        Returns:
-            frame: Frame with drawn boxes
-        """
-        for conf, x1, y1, x2, y2 in detections:
-            # Draw bounding box
-            color = (0, 255, 0)  # Green for person
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw confidence label
-            label = f"Person: {conf:.2f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            
-            # Background for label
-            cv2.rectangle(
-                frame,
-                (x1, y1 - label_size[1] - 10),
-                (x1 + label_size[0], y1),
-                color,
-                -1
-            )
-            
-            # Text label
-            cv2.putText(
-                frame,
-                label,
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 0),
-                2
-            )
-        
-        return frame
-        
     def connect(self):
         """Connect to the camera and initialize services"""
         try:
@@ -558,10 +630,6 @@ class PersonAlarmManager:
                 print("Imaging service initialized successfully")
             except Exception as e:
                 print(f"Warning: Imaging service not available: {e}")
-            
-           
-            
-            # Initialize Tapo controller for alarm
             
             # Get stream URL (prioritize stream2 for lower latency)
             self._get_stream_url()
@@ -696,272 +764,6 @@ class PersonAlarmManager:
             print(f"Failed to initialize video stream: {e}")
             return False
     
-    def _lidar_thread(self):             
-
-        # Initialize LIDAR
-        lidar = PyRPlidar()
-        lidar.connect(port="/dev/ttyUSB0", baudrate=115200, timeout=3)
-        
-
-        # Get device information
-        try:
-            info = lidar.get_info()
-            print("info:", info)
-
-            if info == 'device is connected':
-                self.lidar_port_ok = True
-        except Exception as e:
-            self.lidar_port_ok = False
-
-        health = lidar.get_health()
-        print("health:", health)
-
-        samplerate = lidar.get_samplerate()
-        print("samplerate:", samplerate)
-
-        # Start motor
-        lidar.set_motor_pwm(500)
-
-        # Get scan modes
-        scan_modes = lidar.get_scan_modes()
-        print("\nAvailable scan modes:")
-        for idx, mode in enumerate(scan_modes):
-            print(f"  Mode {idx}: {mode}")
-
-        # Wait for motor to spin up
-        time.sleep(2)
-
-        if self.lidar_debug_image == True:
-
-
-            # Visualization parameters
-            self.IMAGE_SIZE = 800  # Size of the display window
-            self.CENTER = self.IMAGE_SIZE // 2  # Center point of the image
-            self.SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
-            self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
-
-        # Start scanning with mode 2 (Boost)
-        scan_mode =  2 #min(2, len(scan_modes) - 1)
-        print(f"\nUsing scan mode: {scan_mode}")
-
-        scan_generator = lidar.start_scan_express(scan_mode)()  # Call the function to get generator
-
-        print("\nStarting visualization... Press 'q' to quit\n")
-
-
-        try:
-            
-            target_scan_rate = 5  # Hz - scans per second
-            scan_interval = 1.0 / target_scan_rate
-
-            while True:
-                # Create a white image
-                # image = None
-                # if self.lidar_debug_image:
-                #     image = np.ones((self.IMAGE_SIZE, self.IMAGE_SIZE, 3), dtype=np.uint8) * 255
-                
-               
-                scan_start_time = time.time()
-                # Collect points for one complete scan (360 degrees)
-                scan_points = []
-                scan_started = False
-                
-                for measurement in scan_generator:
-                    # PyRPlidarMeasurement has dict-like string representation
-                    # Parse the measurement data
-                    meas_str = str(measurement)
-                    
-                    # Extract values using string parsing (simple approach)
-                    # Format: "{'start_flag': False, 'quality': 188, 'angle': 353.421875, 'distance': 1136.0}"
-                    try:
-                        # Simple parsing
-                        start_flag = 'True' in meas_str.split("'start_flag': ")[1].split(',')[0]
-                        quality = int(meas_str.split("'quality': ")[1].split(',')[0])
-                        angle = float(meas_str.split("'angle': ")[1].split(',')[0])
-                        distance = float(meas_str.split("'distance': ")[1].split('}')[0])
-                    except:
-                        continue  # Skip malformed data
-                    
-                    # If we see a start flag and we've already started collecting, we have a complete scan
-                    if start_flag and scan_started:
-                        break
-                    
-                    if start_flag:
-                        scan_started = True
-                    
-                    # Collect valid points
-                    if distance > 0 and quality > 0:
-                        scan_points.append((angle, distance))
-                    
-                    # # Safety: if we have too many points, break
-                    if len(scan_points) > 10000:
-                        break
-                
-                # Draw all collected points
-
-                if  self.calibration_cmd == True:
-                    self.calibration_cmd = False
-                    self.is_map_calibrated = False
-                    self.is_calibration_active = True
-                    self.calibration_points = []  # Reset calibration points
-                    self.calibration_count = 0
-
-                if len(scan_points) < 50:
-                    continue
-
-                # Collect 2D real-world coordinates and pixel coordinates
-                scan_real_points = []  # (real_x, real_y) in mm
-                scan_pixel_coords = []  # (px, py) for drawing
-
-                valid_points = 0
-                for angle, distance in scan_points:
-                    # Convert polar coordinates to Cartesian
-                    angle_rad = math.radians(angle)
-                    
-                    real_x = float( (distance/1000.0) * math.cos(angle_rad)) 
-                    real_y = float( (distance/1000.0) * math.sin(angle_rad)) 
-
-                    # print(f' the distnace is {distance} real_x {real_x} real_y {real_y} ')
-                    # Store real-world coordinates
-                    scan_real_points.append((real_x, real_y))
-                    
-                    # if self.lidar_debug_image:
-                    #     # Calculate x, y coordinates (invert y for image coordinates)
-                    #     x = int(self.CENTER + (distance / self.SCALE) * math.cos(angle_rad))
-                    #     y = int(self.CENTER - (distance / self.SCALE) * math.sin(angle_rad))
-                    #     # Draw point if within image bounds
-                    #     if 0 <= x < self.IMAGE_SIZE and 0 <= y < self.IMAGE_SIZE:
-                    #         scan_pixel_coords.append((x, y))
-                    #         cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
-                    #         valid_points += 1
-                    #     else:
-                    #         scan_pixel_coords.append(None)  # Mark as out of bounds
-                
-                # CALIBRATION: Collect points during calibration phase
-                if self.is_calibration_active :
-                    for real_x, real_y in scan_real_points:
-                        self.calibration_points.append([real_x, real_y])
-                    
-                    self.calibration_count += 1
-                    print(f' calibration_count {self.calibration_count }')
-                    # Display calibration progress
-
-                    # if self.lidar_debug_image:
-
-                    #     calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
-                    #     cv2.putText(image, calib_text, (10, 120),
-                    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    
-                    if self.calibration_count >= self.MAX_CALIBRATION_COUNT:
-                        self.is_calibration_active = False
-                        self.is_map_calibrated = self._build_kdtree()
-                        print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
-                
-                # MOTION DETECTION: After calibration, detect motion points
-                if self.is_map_calibrated and self.rotating_to_target_active == False and self.system_state == 'auto':
-                    self.motion_points = self.collect_motion_points(scan_real_points)
-                    
-                    # NEW: Cluster the motion points
-                    self.detected_clusters = self.cluster_motion_points(self.motion_points)
-                    if len(self.detected_clusters) > 0:
-                        # Get the closest cluster (already sorted by distance to origin)
-                        closest_cluster = self.detected_clusters[0]
-                        center_x, center_y = closest_cluster['center']
-                        points_cluter = closest_cluster['points']
-                        
-                        if (len(points_cluter) > 5 ):
-                            # Calculate angle to closest cluster center
-                            angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
-                            self.lidar_target_deg = angle_to_cluster
-                            print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° (distance: {closest_cluster['distance_to_origin']:.2f}m)")
-                    else:
-                        print(' nno clusters')
-                    # # Draw motion points as red circles
-                    # motion_count = 0
-                    # for i, (real_x, real_y) in enumerate(self.motion_points):
-                    #     if i < len(scan_real_points):
-                    #         # Find corresponding pixel coordinate
-                    #         for j, (rx, ry) in enumerate(scan_real_points):
-                    #             if abs(rx - real_x) < 0.1 and abs(ry - real_y) < 0.1:
-                    #                 if j < len(scan_pixel_coords) and scan_pixel_coords[j] is not None:
-                    #                     px, py = scan_pixel_coords[j]
-
-                    #                     # if self.lidar_debug_image:    
-                    #                     #     cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
-                                        
-                    #                     motion_count += 1
-                    #                 break
-                    
-                    # # Display motion detection info
-                    # if motion_count > 0:
-                    #     print('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')
-                    #     # if self.lidar_debug_image:    
-                    #         # motion_text = f"MOTION: {motion_count} points, {len(self.detected_clusters)} clusters"
-                    #         # cv2.putText(image, motion_text, (10, 120),
-                    #         #         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        
-                    #     # If significant motion detected (at least one cluster), trigger alarm logic
-                    #     if len(self.detected_clusters) > 0:
-                    #         # Get the closest cluster (already sorted by distance to origin)
-                    #         closest_cluster = self.detected_clusters[0]
-                    #         center_x, center_y = closest_cluster['center']
-                            
-                    #         # Calculate angle to closest cluster center
-                    #         angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
-                    #         self.lidar_target_deg = angle_to_cluster
-                    #         print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° (distance: {closest_cluster['distance_to_origin']:.2f}m)")
-                    # else:
-                    #     print('nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn')
-                
-
-                # Rate limiting
-                elapsed = time.time() - scan_start_time
-                sleep_time = scan_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                # Add text information
-                # if self.lidar_debug_image:    
-                #     cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                #     cv2.putText(image, f"Points: {valid_points}", (10, 60),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                #     cv2.putText(image, "Press 'q' to quit", (10, 90),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                
-                # Display the image
-                # cv2.imshow('LIDAR Scan', image)
-                # if self.lidar_debug_image:  
-                #     cv2.imwrite(f'/home/pi/person_alarm_ws/{self.count_debug}.jpg', image)
-                #     self.count_debug += 1
-                
-                # Break loop if 'q' is pressed
-                # if cv2.waitKey(1) & 0xFF == ord('q'):
-                #     break
-
-        except KeyboardInterrupt:
-            self.lidar_port_ok = False
-
-            print("\nStopping...")
-        except Exception as e:
-            self.lidar_port_ok = False
-
-            print(f"\nError occurred: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.lidar_port_ok = False
-
-            # Cleanup
-            print("Cleaning up...")
-            lidar.set_motor_pwm(0)
-            lidar.stop()
-            lidar.disconnect()
-            cv2.destroyAllWindows()
-            print("LIDAR disconnected and cleanup complete")
-
-
-
-
     def _frame_capture_thread(self):
         """Continuously capture frames in background thread to avoid buffering"""
         print("Frame capture thread started")
@@ -1079,61 +881,14 @@ class PersonAlarmManager:
             return False
     
     def go_home(self):
-        print('go home')
+        print('🏠 Going home')
         self.abs_pan(0.0, 1)
         self.abs_tilt(0.0, 1)
-
-
-    def _handle_arrow_keys(self, key):
-        """
-        Handle arrow key presses for camera control
-        
-        Args:
-            key: The key code from cv2.waitKey()
-        """
-        direction = None
-        
-        if key == 83 or key == 3:  # Left arrow
-            direction = 'left'
-            print(f"⬅️  Left arrow: pan {self.current_pan:.2f} -> {self.current_pan - self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
-            
-        elif key == 81 or key == 2:  # Right arrow
-            direction = 'right'
-            print(f"➡️  Right arrow: pan {self.current_pan:.2f} -> {self.current_pan + self.pan_step:.2f} (speed: {self.pan_speed:.2f})")
-            
-        elif key == 82 or key == 0:  # Up arrow
-            direction = 'up'
-            print(f"⬆️  Up arrow: tilt {self.current_tilt:.2f} -> {self.current_tilt + self.tilt_step:.2f} (speed: {self.tilt_speed:.2f})")
-            
-        elif key == 84 or key == 1:  # Down arrow
-            direction = 'down'
-            print(f"⬇️  Down arrow: tilt {self.current_tilt:.2f} -> {self.current_tilt - self.tilt_step:.2f} (speed: {self.tilt_speed:.2f})")
-        
-        elif key == ord('h') or key == ord('H'):  # 'h' or 'H' key
-
-            direction = 'home'
-
-        elif key == ord('b') or key == ord('B'):  # BEEP Key:
-            self.play_beep()
-
-        # Execute PTZ move in separate thread (non-blocking)
-        if direction:
-            if self.ptz_thread is None or not self.ptz_thread.is_alive():
-                self.ptz_thread = threading.Thread(
-                    target=self._execute_ptz_move,
-                    args=(direction,)
-                )
-                self.ptz_thread.daemon = True
-                self.ptz_thread.start()
-    
-   
     
     def rotate_to_target(self, lidar_target_deg):
         onvif_pan = self.pan_degrees_to_onvif(lidar_target_deg)
         self.abs_pan(onvif_pan, 1)
-
         self.wanted_pan = onvif_pan
-
 
     def pan_degrees_to_onvif(self, degrees):
         """Convert degrees to ONVIF normalized value"""
@@ -1249,7 +1004,6 @@ class PersonAlarmManager:
             traceback.print_exc()
 
     def run(self):
-     
         if not self.video_capture or not self.video_capture.isOpened():
             print("Video capture not initialized")
             return
@@ -1262,10 +1016,10 @@ class PersonAlarmManager:
         self.capture_thread.daemon = True
         self.capture_thread.start()
 
-        # Start background frame capture thread
-        self.lidar_thread = threading.Thread(target=self._lidar_thread)
-        self.lidar_thread.daemon = True
-        self.lidar_thread.start()
+        # Start LiDAR timeout checker thread
+        timeout_thread = threading.Thread(target=self._check_lidar_timeout)
+        timeout_thread.daemon = True
+        timeout_thread.start()
         
         target_hz = 10
         target_interval = 1.0 / target_hz  # 0.1 seconds for 10 Hz
@@ -1274,14 +1028,6 @@ class PersonAlarmManager:
         fps_start_time = time.time()
         fps_counter = 0
         fps = 0
-        
-        # Detection display toggle
-        show_detections = True
-        
-        # Detection timing (run detection less frequently for performance)
-        detection_interval = 0.2  # Run detection every 200ms (5 Hz)
-        last_detection_run = 0
-        cached_detections = []
         
         # Status publishing timing
         status_publish_interval = 0.5  # Publish status every 500ms (2 Hz)
@@ -1293,130 +1039,92 @@ class PersonAlarmManager:
             self.running = False
             return
         
+        print("✅ System running - waiting for LiDAR data and motion detection...")
+        
         while self.running:
-            
             loop_start_time = time.time()
             
-            # # Get latest frame from background thread
-            # with self.frame_lock:
-            #     if self.latest_frame is None:
-            #         time.sleep(0.001)
-            #         continue
-            #     frame = self.latest_frame.copy()
+            # Get latest frame from background thread
+            with self.frame_lock:
+                if self.latest_frame is None:
+                    time.sleep(0.001)
+                    continue
+                frame = self.latest_frame.copy()
             
             fps_counter += 1
             
-            # # Calculate FPS every second
+            # Calculate FPS every second
             current_time = time.time()
             if current_time - fps_start_time >= 1.0:
                 fps = fps_counter / (current_time - fps_start_time)
                 fps_start_time = current_time
                 fps_counter = 0
             
-
-            # if self.rotating_to_target_active:
-            #     self.lidar_target_deg = None
-
-            #     pan, tilt, zoom = self.get_current_ptz()
+            # Camera rotation and detection logic
+            if self.rotating_to_target_active:
+                self.lidar_target_deg = None
+                pan, tilt, zoom = self.get_current_ptz()
                 
-            #     if math.fabs(self.wanted_pan - pan) < 0.05:
+                if math.fabs(self.wanted_pan - pan) < 0.05:
+                    self.conut_frame_for_detect += 1
 
-            #         self.conut_frame_for_detect+= 1
+                    if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
+                        self.rotating_to_target_active = False
+                        self.conut_frame_for_detect = 0
 
-
-            #         if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
-            #             self.rotating_to_target_active = False
-            #             self.conut_frame_for_detect = 0
-
-            #         self.enable_detection = True
-            #         self.detection_active = True
-            #         detections = self._detect_persons(frame)
-            #         if len(detections) > 0:
-
-            #             self.rotating_to_target_active = False
-            #             self.conut_frame_for_detect = 0
+                    self.enable_detection = True
+                    self.detection_active = True
+                    detections = self._detect_persons(frame)
+                    
+                    if len(detections) > 0:
+                        self.rotating_to_target_active = False
+                        self.conut_frame_for_detect = 0
                         
-            #             print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
-                            
-            #             self.play_beep()
-            #             time.sleep(0.1)
-            #             self.play_beep()
-            #             time.sleep(0.1)
-            #             self.play_beep()
+                        print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
+                        
+                        # Triple beep alarm
+                        self.play_beep()
+                        time.sleep(0.1)
+                        self.play_beep()
+                        time.sleep(0.1)
+                        self.play_beep()
 
-
-            #             self.enable_detection = False
-            #             self.detection_active = False
-
-            #             self.go_home()
-
-            #         else:
-            #             self.rotating_to_target_active = False    
-            #             print(' noooo person no person !!!!!') 
-            #             self.go_home() 
+                        self.enable_detection = False
+                        self.detection_active = False
+                        self.go_home()
+                    else:
+                        self.rotating_to_target_active = False    
+                        print('⚠️  No person detected at target location') 
+                        self.go_home() 
                 
-            # elif self.lidar_target_deg != None:
-
-            #     self.rotate_to_target(self.lidar_target_deg)
-            #     self.lidar_target_deg = None
-            #     self.rotating_to_target_active = True
-                
-
-            # if self.system_state == 'manual' and self.rotating_to_target_active:
-            #     self.enable_detection = False
-            #     self.detection_active = False
-            #     self.rotating_to_target_active = False   
-
-            #     self.go_home()
-
-          
-
-
+            elif self.lidar_target_deg is not None:
+                self.rotate_to_target(self.lidar_target_deg)
+                self.lidar_target_deg = None
+                self.rotating_to_target_active = True
             
-          
+            # Manual mode override
+            if self.system_state == 'manual' and self.rotating_to_target_active:
+                self.enable_detection = False
+                self.detection_active = False
+                self.rotating_to_target_active = False   
+                self.go_home()
+            
             # Publish status periodically
             if current_time - last_status_publish >= status_publish_interval:
                 self.publish_status()
                 last_status_publish = current_time
             
-            # Calculate sleep time to maintain 10 Hz
+            # Calculate sleep time to maintain target Hz
             loop_elapsed = time.time() - loop_start_time
             sleep_time = target_interval - loop_elapsed
             
             if sleep_time > 0:
                 time.sleep(sleep_time)
             
-            
             frame_count += 1
         
         cv2.destroyAllWindows()
         print("Run loop stopped")
-
-    def disconnect(self):
-        """Clean up and disconnect"""
-        self.running = False
-        
-        # Stop MQTT client
-        if self.mqtt_client:
-            print("Disconnecting MQTT client...")
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
-        
-        # Wait for capture thread to stop
-        if self.capture_thread and self.capture_thread.is_alive():
-            print("Waiting for capture thread to stop...")
-            self.capture_thread.join(timeout=2.0)
-        
-        # Wait for any pending PTZ commands to complete
-        if self.ptz_thread and self.ptz_thread.is_alive():
-            print("Waiting for PTZ command to complete...")
-            self.ptz_thread.join(timeout=2.0)
-        
-        if self.video_capture:
-            self.video_capture.release()
-        
-        cv2.destroyAllWindows()
-        print("Disconnected from camera")
 
 
 def main():
@@ -1430,6 +1138,7 @@ def main():
     MQTT_PORT = 1883
     MQTT_TOPIC = "camera/control"
     MQTT_STATUS_TOPIC = "camera/status"  # Status publishing topic
+    MQTT_LIDAR_TOPIC = "lidar/scan"  # NEW: Topic to receive LiDAR scans
     
     # Absolute positioning settings with speed control
     PAN_STEP = 0.1    # Step size for each arrow key press
@@ -1460,6 +1169,7 @@ def main():
         mqtt_port=MQTT_PORT,
         mqtt_topic=MQTT_TOPIC,
         mqtt_status_topic=MQTT_STATUS_TOPIC,
+        mqtt_lidar_topic=MQTT_LIDAR_TOPIC,  # NEW
         motion_threshold=MOTION_THRESHOLD,
         clustering_max_distance=CLUSTERING_MAX_DISTANCE
     ) 
@@ -1471,6 +1181,7 @@ def main():
             return
         
         print("✅ Successfully connected!")
+        print("📡 Waiting for LiDAR scan data on MQTT topic:", MQTT_LIDAR_TOPIC)
         
         # Start the main run loop
         manager.run()
