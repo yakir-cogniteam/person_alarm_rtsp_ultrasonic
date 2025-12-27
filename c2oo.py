@@ -12,7 +12,11 @@ import wave
 import math
 import paho.mqtt.client as mqtt
 from scipy.spatial import KDTree
-
+from pyrplidar import PyRPlidar
+import cv2
+import numpy as np
+import math
+import time
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
@@ -55,6 +59,14 @@ class PersonAlarmManager:
         self.kdtree = None  # KDTree structure for fast nearest neighbor queries
         self.motion_threshold = motion_threshold  # Distance threshold in meters (e.g., 0.5)
         self.motion_points = []  # List to store detected motion points in current frame      
+
+        # lidar debug
+        self.lidar_debug_image = True
+        self.IMAGE_SIZE = None  # Size of the display window
+        self.CENTER = None  # Center point of the image
+        self.SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
+        self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
+        self.count_debug = 0
 
 
         self.system_state = 'auto' # auto / manual
@@ -613,15 +625,7 @@ class PersonAlarmManager:
             print(f"Failed to initialize video stream: {e}")
             return False
     
-    def _lidar_thread(self):
-
-        
-
-        from pyrplidar import PyRPlidar
-        import cv2
-        import numpy as np
-        import math
-        import time
+    def _lidar_thread(self):             
 
         # Initialize LIDAR
         lidar = PyRPlidar()
@@ -656,26 +660,30 @@ class PersonAlarmManager:
         # Wait for motor to spin up
         time.sleep(2)
 
-        # Visualization parameters
-        IMAGE_SIZE = 800  # Size of the display window
-        CENTER = IMAGE_SIZE // 2  # Center point of the image
-        SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
-        MAX_DISTANCE = 3500  # Maximum distance in mm to display
+        if self.lidar_debug_image == True:
+
+
+            # Visualization parameters
+            self.IMAGE_SIZE = 800  # Size of the display window
+            self.CENTER = self.IMAGE_SIZE // 2  # Center point of the image
+            self.SCALE = 20  # Scale factor (pixels per mm) - adjusted for 3m range
+            self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
 
         # Start scanning with mode 2 (Boost)
-        scan_mode = min(2, len(scan_modes) - 1)
+        scan_mode = 0 #min(2, len(scan_modes) - 1)
         print(f"\nUsing scan mode: {scan_mode}")
 
         scan_generator = lidar.start_scan_express(scan_mode)()  # Call the function to get generator
 
         print("\nStarting visualization... Press 'q' to quit\n")
 
-        frame_count = 0
 
         try:
             while True:
                 # Create a white image
-                image = np.ones((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8) * 255
+                image = None
+                if self.lidar_debug_image:
+                    image = np.ones((self.IMAGE_SIZE, self.IMAGE_SIZE, 3), dtype=np.uint8) * 255
                 
                
                 
@@ -707,12 +715,12 @@ class PersonAlarmManager:
                         scan_started = True
                     
                     # Collect valid points
-                    if distance > 0 and distance < MAX_DISTANCE and quality > 0:
+                    if distance > 0 and quality > 0 and distance < (7 * 1000):
                         scan_points.append((angle, distance))
                     
-                    # Safety: if we have too many points, break
-                    if len(scan_points) > 10000:
-                        break
+                    # # Safety: if we have too many points, break
+                    # if len(scan_points) > 10000:
+                    #     break
                 
                 # Draw all collected points
 
@@ -734,9 +742,6 @@ class PersonAlarmManager:
                     angle_rad = math.radians(angle)
                     
                    
-                    # Calculate x, y coordinates (invert y for image coordinates)
-                    x = int(CENTER + (distance / SCALE) * math.cos(angle_rad))
-                    y = int(CENTER - (distance / SCALE) * math.sin(angle_rad))
 
                     real_x = float( (distance/1000.0) * math.cos(angle_rad)) 
                     real_y = float( (distance/1000.0) * math.sin(angle_rad)) 
@@ -745,13 +750,17 @@ class PersonAlarmManager:
                     # Store real-world coordinates
                     scan_real_points.append((real_x, real_y))
                     
-                    # Draw point if within image bounds
-                    if 0 <= x < IMAGE_SIZE and 0 <= y < IMAGE_SIZE:
-                        scan_pixel_coords.append((x, y))
-                        cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
-                        valid_points += 1
-                    else:
-                        scan_pixel_coords.append(None)  # Mark as out of bounds
+                    if self.lidar_debug_image:
+                        #Calculate x, y coordinates (invert y for image coordinates)
+                        x = int(self.CENTER + (distance / self.SCALE) * math.cos(angle_rad))
+                        y = int(self.CENTER - (distance / self.SCALE) * math.sin(angle_rad))
+                        #Draw point if within image bounds
+                        if 0 <= x < self.IMAGE_SIZE and 0 <= y < self.IMAGE_SIZE:
+                            scan_pixel_coords.append((x, y))
+                            cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
+                            valid_points += 1
+                        else:
+                            scan_pixel_coords.append(None)  # Mark as out of bounds
                 
                 # CALIBRATION: Collect points during calibration phase
                 if self.is_calibration_active :
@@ -759,11 +768,14 @@ class PersonAlarmManager:
                         self.calibration_points.append([real_x, real_y])
                     
                     self.calibration_count += 1
-                    
+                    print(f' calibration_count {self.calibration_count }')
                     # Display calibration progress
-                    calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
-                    cv2.putText(image, calib_text, (10, 120),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                    if self.lidar_debug_image:
+
+                        calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
+                        cv2.putText(image, calib_text, (10, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
                     if self.calibration_count >= self.MAX_CALIBRATION_COUNT:
                         self.is_calibration_active = False
@@ -783,18 +795,23 @@ class PersonAlarmManager:
                                 if abs(rx - real_x) < 0.1 and abs(ry - real_y) < 0.1:
                                     if j < len(scan_pixel_coords) and scan_pixel_coords[j] is not None:
                                         px, py = scan_pixel_coords[j]
-                                        cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
+
+                                        if self.lidar_debug_image:    
+                                            cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
+                                        
                                         motion_count += 1
                                     break
                     
                     # Display motion detection info
                     if motion_count > 0:
-                        motion_text = f"MOTION: {motion_count} points"
-                        cv2.putText(image, motion_text, (10, 120),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        print('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')
+                        if self.lidar_debug_image:    
+                            motion_text = f"MOTION: {motion_count} points"
+                            cv2.putText(image, motion_text, (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         
                         # If significant motion detected, trigger alarm logic
-                        if motion_count > 10:  # Threshold for significant motion
+                        if motion_count > 20:  # Threshold for significant motion
                             # Find the angle of the centroid of motion points
                             motion_angles = []
                             for real_x, real_y in self.motion_points:
@@ -805,19 +822,22 @@ class PersonAlarmManager:
                                 avg_angle = sum(motion_angles) / len(motion_angles)
                                 self.lidar_target_deg = avg_angle
                                 print(f"🎯 Motion detected at angle: {avg_angle:.1f}°")
-                
-                # Add text information
-                cv2.putText(image, f"Frame: {frame_count}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                cv2.putText(image, f"Points: {valid_points}", (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                cv2.putText(image, "Press 'q' to quit", (10, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    else:
+                        print('nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn')
+                # # Add text information
+                # if self.lidar_debug_image:    
+                #     cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                #     cv2.putText(image, f"Points: {valid_points}", (10, 60),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                #     cv2.putText(image, "Press 'q' to quit", (10, 90),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
                 
                 # # Display the image
                 # cv2.imshow('LIDAR Scan', image)
-                
-                # frame_count += 1
+                # if self.lidar_debug_image:  
+                #     cv2.imwrite(f'/home/pi/person_alarm_ws/frames/{self.count_debug}.jpg', image)
+                #     self.count_debug += 1
                 
                 # # Break loop if 'q' is pressed
                 # if cv2.waitKey(1) & 0xFF == ord('q'):
