@@ -741,7 +741,7 @@ class PersonAlarmManager:
             self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
 
         # Start scanning with mode 2 (Boost)
-        scan_mode = min(2, len(scan_modes) - 1)
+        scan_mode =  2 #min(2, len(scan_modes) - 1)
         print(f"\nUsing scan mode: {scan_mode}")
 
         scan_generator = lidar.start_scan_express(scan_mode)()  # Call the function to get generator
@@ -750,14 +750,18 @@ class PersonAlarmManager:
 
 
         try:
+            
+            target_scan_rate = 5  # Hz - scans per second
+            scan_interval = 1.0 / target_scan_rate
+
             while True:
                 # Create a white image
-                image = None
-                if self.lidar_debug_image:
-                    image = np.ones((self.IMAGE_SIZE, self.IMAGE_SIZE, 3), dtype=np.uint8) * 255
+                # image = None
+                # if self.lidar_debug_image:
+                #     image = np.ones((self.IMAGE_SIZE, self.IMAGE_SIZE, 3), dtype=np.uint8) * 255
                 
                
-                
+                scan_start_time = time.time()
                 # Collect points for one complete scan (360 degrees)
                 scan_points = []
                 scan_started = False
@@ -786,12 +790,12 @@ class PersonAlarmManager:
                         scan_started = True
                     
                     # Collect valid points
-                    if distance > 0 : #and quality > 0:
+                    if distance > 0 and quality > 0:
                         scan_points.append((angle, distance))
                     
                     # # Safety: if we have too many points, break
-                    # if len(scan_points) > 10000:
-                    #     break
+                    if len(scan_points) > 10000:
+                        break
                 
                 # Draw all collected points
 
@@ -802,7 +806,9 @@ class PersonAlarmManager:
                     self.calibration_points = []  # Reset calibration points
                     self.calibration_count = 0
 
-               
+                if len(scan_points) < 50:
+                    continue
+
                 # Collect 2D real-world coordinates and pixel coordinates
                 scan_real_points = []  # (real_x, real_y) in mm
                 scan_pixel_coords = []  # (px, py) for drawing
@@ -819,17 +825,17 @@ class PersonAlarmManager:
                     # Store real-world coordinates
                     scan_real_points.append((real_x, real_y))
                     
-                    if self.lidar_debug_image:
-                        # Calculate x, y coordinates (invert y for image coordinates)
-                        x = int(self.CENTER + (distance / self.SCALE) * math.cos(angle_rad))
-                        y = int(self.CENTER - (distance / self.SCALE) * math.sin(angle_rad))
-                        # Draw point if within image bounds
-                        if 0 <= x < self.IMAGE_SIZE and 0 <= y < self.IMAGE_SIZE:
-                            scan_pixel_coords.append((x, y))
-                            cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
-                            valid_points += 1
-                        else:
-                            scan_pixel_coords.append(None)  # Mark as out of bounds
+                    # if self.lidar_debug_image:
+                    #     # Calculate x, y coordinates (invert y for image coordinates)
+                    #     x = int(self.CENTER + (distance / self.SCALE) * math.cos(angle_rad))
+                    #     y = int(self.CENTER - (distance / self.SCALE) * math.sin(angle_rad))
+                    #     # Draw point if within image bounds
+                    #     if 0 <= x < self.IMAGE_SIZE and 0 <= y < self.IMAGE_SIZE:
+                    #         scan_pixel_coords.append((x, y))
+                    #         cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
+                    #         valid_points += 1
+                    #     else:
+                    #         scan_pixel_coords.append(None)  # Mark as out of bounds
                 
                 # CALIBRATION: Collect points during calibration phase
                 if self.is_calibration_active :
@@ -840,11 +846,11 @@ class PersonAlarmManager:
                     print(f' calibration_count {self.calibration_count }')
                     # Display calibration progress
 
-                    if self.lidar_debug_image:
+                    # if self.lidar_debug_image:
 
-                        calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
-                        cv2.putText(image, calib_text, (10, 120),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    #     calib_text = f"CALIBRATING: {self.calibration_count}/{self.MAX_CALIBRATION_COUNT}"
+                    #     cv2.putText(image, calib_text, (10, 120),
+                    #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     
                     if self.calibration_count >= self.MAX_CALIBRATION_COUNT:
                         self.is_calibration_active = False
@@ -857,58 +863,76 @@ class PersonAlarmManager:
                     
                     # NEW: Cluster the motion points
                     self.detected_clusters = self.cluster_motion_points(self.motion_points)
-                    
-                    # Draw motion points as red circles
-                    motion_count = 0
-                    for i, (real_x, real_y) in enumerate(self.motion_points):
-                        if i < len(scan_pixel_coords):
-                            # Find corresponding pixel coordinate
-                            for j, (rx, ry) in enumerate(scan_real_points):
-                                if abs(rx - real_x) < 0.1 and abs(ry - real_y) < 0.1:
-                                    if j < len(scan_pixel_coords) and scan_pixel_coords[j] is not None:
-                                        px, py = scan_pixel_coords[j]
-
-                                        if self.lidar_debug_image:    
-                                            cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
-                                        
-                                        motion_count += 1
-                                    break
-                    
-                    # Display motion detection info
-                    if motion_count > 0:
-                        print('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')
-                        if self.lidar_debug_image:    
-                            motion_text = f"MOTION: {motion_count} points, {len(self.detected_clusters)} clusters"
-                            cv2.putText(image, motion_text, (10, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if len(self.detected_clusters) > 0:
+                        # Get the closest cluster (already sorted by distance to origin)
+                        closest_cluster = self.detected_clusters[0]
+                        center_x, center_y = closest_cluster['center']
+                        points_cluter = closest_cluster['points']
                         
-                        # If significant motion detected (at least one cluster), trigger alarm logic
-                        if len(self.detected_clusters) > 0:
-                            # Get the closest cluster (already sorted by distance to origin)
-                            closest_cluster = self.detected_clusters[0]
-                            center_x, center_y = closest_cluster['center']
-                            
+                        if (len(points_cluter) > 5 ):
                             # Calculate angle to closest cluster center
                             angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
                             self.lidar_target_deg = angle_to_cluster
                             print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° (distance: {closest_cluster['distance_to_origin']:.2f}m)")
                     else:
-                        print('nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn')
+                        print(' nno clusters')
+                    # # Draw motion points as red circles
+                    # motion_count = 0
+                    # for i, (real_x, real_y) in enumerate(self.motion_points):
+                    #     if i < len(scan_real_points):
+                    #         # Find corresponding pixel coordinate
+                    #         for j, (rx, ry) in enumerate(scan_real_points):
+                    #             if abs(rx - real_x) < 0.1 and abs(ry - real_y) < 0.1:
+                    #                 if j < len(scan_pixel_coords) and scan_pixel_coords[j] is not None:
+                    #                     px, py = scan_pixel_coords[j]
+
+                    #                     # if self.lidar_debug_image:    
+                    #                     #     cv2.circle(image, (px, py), 5, (0, 0, 255), -1)
+                                        
+                    #                     motion_count += 1
+                    #                 break
+                    
+                    # # Display motion detection info
+                    # if motion_count > 0:
+                    #     print('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')
+                    #     # if self.lidar_debug_image:    
+                    #         # motion_text = f"MOTION: {motion_count} points, {len(self.detected_clusters)} clusters"
+                    #         # cv2.putText(image, motion_text, (10, 120),
+                    #         #         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                    #     # If significant motion detected (at least one cluster), trigger alarm logic
+                    #     if len(self.detected_clusters) > 0:
+                    #         # Get the closest cluster (already sorted by distance to origin)
+                    #         closest_cluster = self.detected_clusters[0]
+                    #         center_x, center_y = closest_cluster['center']
+                            
+                    #         # Calculate angle to closest cluster center
+                    #         angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
+                    #         self.lidar_target_deg = angle_to_cluster
+                    #         print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° (distance: {closest_cluster['distance_to_origin']:.2f}m)")
+                    # else:
+                    #     print('nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn')
                 
+
+                # Rate limiting
+                elapsed = time.time() - scan_start_time
+                sleep_time = scan_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
                 # Add text information
-                if self.lidar_debug_image:    
-                    cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                    cv2.putText(image, f"Points: {valid_points}", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                    cv2.putText(image, "Press 'q' to quit", (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                # if self.lidar_debug_image:    
+                #     cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                #     cv2.putText(image, f"Points: {valid_points}", (10, 60),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                #     cv2.putText(image, "Press 'q' to quit", (10, 90),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
                 
                 # Display the image
                 # cv2.imshow('LIDAR Scan', image)
-                if self.lidar_debug_image:  
-                    cv2.imwrite(f'/home/pi/person_alarm_ws/{self.count_debug}.jpg', image)
-                    self.count_debug += 1
+                # if self.lidar_debug_image:  
+                #     cv2.imwrite(f'/home/pi/person_alarm_ws/{self.count_debug}.jpg', image)
+                #     self.count_debug += 1
                 
                 # Break loop if 'q' is pressed
                 # if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1270,18 +1294,19 @@ class PersonAlarmManager:
             return
         
         while self.running:
+            
             loop_start_time = time.time()
             
-            # Get latest frame from background thread
-            with self.frame_lock:
-                if self.latest_frame is None:
-                    time.sleep(0.001)
-                    continue
-                frame = self.latest_frame.copy()
+            # # Get latest frame from background thread
+            # with self.frame_lock:
+            #     if self.latest_frame is None:
+            #         time.sleep(0.001)
+            #         continue
+            #     frame = self.latest_frame.copy()
             
             fps_counter += 1
             
-            # Calculate FPS every second
+            # # Calculate FPS every second
             current_time = time.time()
             if current_time - fps_start_time >= 1.0:
                 fps = fps_counter / (current_time - fps_start_time)
@@ -1289,88 +1314,66 @@ class PersonAlarmManager:
                 fps_counter = 0
             
 
-            if self.rotating_to_target_active:
-                self.lidar_target_deg = None
+            # if self.rotating_to_target_active:
+            #     self.lidar_target_deg = None
 
-                pan, tilt, zoom = self.get_current_ptz()
+            #     pan, tilt, zoom = self.get_current_ptz()
                 
-                if math.fabs(self.wanted_pan - pan) < 0.05:
+            #     if math.fabs(self.wanted_pan - pan) < 0.05:
 
-                    self.conut_frame_for_detect+= 1
+            #         self.conut_frame_for_detect+= 1
 
 
-                    if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
-                        self.rotating_to_target_active = False
-                        self.conut_frame_for_detect = 0
+            #         if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
+            #             self.rotating_to_target_active = False
+            #             self.conut_frame_for_detect = 0
 
-                    self.enable_detection = True
-                    self.detection_active = True
-                    detections = self._detect_persons(frame)
-                    if len(detections) > 0:
+            #         self.enable_detection = True
+            #         self.detection_active = True
+            #         detections = self._detect_persons(frame)
+            #         if len(detections) > 0:
 
-                        self.rotating_to_target_active = False
-                        self.conut_frame_for_detect = 0
+            #             self.rotating_to_target_active = False
+            #             self.conut_frame_for_detect = 0
                         
-                        print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
+            #             print(f"🚨 PERSON DETECTED! (Count: {self.detection_count})")
                             
-                        self.play_beep()
-                        time.sleep(0.1)
-                        self.play_beep()
-                        time.sleep(0.1)
-                        self.play_beep()
+            #             self.play_beep()
+            #             time.sleep(0.1)
+            #             self.play_beep()
+            #             time.sleep(0.1)
+            #             self.play_beep()
 
 
-                        self.enable_detection = False
-                        self.detection_active = False
+            #             self.enable_detection = False
+            #             self.detection_active = False
 
-                        self.go_home()
+            #             self.go_home()
 
-                    else:
-                        self.rotating_to_target_active = False    
-                        print(' noooo person no person !!!!!') 
-                        self.go_home() 
+            #         else:
+            #             self.rotating_to_target_active = False    
+            #             print(' noooo person no person !!!!!') 
+            #             self.go_home() 
                 
-            elif self.lidar_target_deg != None:
+            # elif self.lidar_target_deg != None:
 
-                self.rotate_to_target(self.lidar_target_deg)
-                self.lidar_target_deg = None
-                self.rotating_to_target_active = True
+            #     self.rotate_to_target(self.lidar_target_deg)
+            #     self.lidar_target_deg = None
+            #     self.rotating_to_target_active = True
                 
 
-            if self.system_state == 'manual' and self.rotating_to_target_active:
-                self.enable_detection = False
-                self.detection_active = False
-                self.rotating_to_target_active = False   
+            # if self.system_state == 'manual' and self.rotating_to_target_active:
+            #     self.enable_detection = False
+            #     self.detection_active = False
+            #     self.rotating_to_target_active = False   
 
-                self.go_home()
+            #     self.go_home()
 
           
 
 
             
-            # Add overlay information
-            height, width = frame.shape[:2]
-            
-            
-            # Add FPS counter
-            if fps > 0:
-                fps_text = f"FPS: {fps:.1f}"
-                cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(frame, fps_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-       
-            # # Show the frame
-            # cv2.imshow('Person Alarm Manager', frame)
-            
-            # # Reduced waitKey for faster response (1ms instead of 30ms)
-            # key = cv2.waitKey(1) & 0xFF
-            
-            # if key == ord('q'):
-            #     print("\n⏹️  Quit key pressed")
-            #     break            
-            # elif key != 255:  # 255 means no key was pressed
-            #     # Handle arrow keys (non-blocking)
-            #     self._handle_arrow_keys(key)
-            
+          
             # Publish status periodically
             if current_time - last_status_publish >= status_publish_interval:
                 self.publish_status()
