@@ -17,12 +17,14 @@ import cv2
 import numpy as np
 import math
 import time
+from sklearn.cluster import DBSCAN
+import json
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
                  pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
                  mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status",
-                 motion_threshold=0.5):
+                 motion_threshold=0.5, clustering_max_distance=0.2):
 
         self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
         #self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -60,6 +62,10 @@ class PersonAlarmManager:
         self.motion_threshold = motion_threshold  # Distance threshold in meters (e.g., 0.5)
         self.motion_points = []  # List to store detected motion points in current frame      
 
+        # NEW: Clustering parameters
+        self.clustering_max_distance = clustering_max_distance  # Max distance between points in same cluster
+        self.detected_clusters = []  # List of detected clusters with their centers and points
+        
         # lidar debug
         self.lidar_debug_image = True
         self.IMAGE_SIZE = None  # Size of the display window
@@ -307,6 +313,71 @@ class PersonAlarmManager:
                 motion_points.append((real_x, real_y))
         
         return motion_points
+    
+    def cluster_motion_points(self, motion_points):
+        """
+        Cluster motion points using DBSCAN algorithm
+        
+        Args:
+            motion_points: List of (real_x, real_y) tuples representing motion
+            
+        Returns:
+            clusters: List of dictionaries, each containing:
+                     - 'points': numpy array of points in cluster
+                     - 'center': (x, y) tuple of cluster center
+                     - 'distance_to_origin': distance from (0,0)
+                     Sorted by distance to origin (closest first)
+        """
+        if len(motion_points) == 0:
+            return []
+        
+        try:
+            # Convert to numpy array
+            points_array = np.array(motion_points)
+            
+            # DBSCAN clustering
+            # eps = maximum distance between two points to be in same cluster
+            # min_samples = minimum number of points to form a cluster
+            clustering = DBSCAN(eps=self.clustering_max_distance, min_samples=3).fit(points_array)
+            
+            labels = clustering.labels_
+            
+            # Group points by cluster
+            clusters = []
+            unique_labels = set(labels)
+            
+            for label in unique_labels:
+                if label == -1:  # Skip noise points
+                    continue
+                
+                # Get all points in this cluster
+                cluster_mask = labels == label
+                cluster_points = points_array[cluster_mask]
+                
+                # Calculate cluster center
+                center_x = np.mean(cluster_points[:, 0])
+                center_y = np.mean(cluster_points[:, 1])
+                center = (float(center_x), float(center_y))
+                
+                # Calculate distance to origin
+                distance_to_origin = math.sqrt(center_x**2 + center_y**2)
+                
+                clusters.append({
+                    'points': cluster_points.tolist(),  # Convert to list for JSON serialization
+                    'center': center,
+                    'distance_to_origin': distance_to_origin
+                })
+            
+            # Sort clusters by distance to origin (closest first)
+            clusters.sort(key=lambda c: c['distance_to_origin'])
+            
+            print(f"🔍 Found {len(clusters)} clusters from {len(motion_points)} motion points")
+            
+            return clusters
+            
+        except Exception as e:
+            print(f"❌ Error clustering motion points: {e}")
+            return []
     
     def draw_motion_points(self, frame, motion_points, pixel_coords):
         """
@@ -670,7 +741,7 @@ class PersonAlarmManager:
             self.MAX_DISTANCE = 3500  # Maximum distance in mm to display
 
         # Start scanning with mode 2 (Boost)
-        scan_mode = 0 #min(2, len(scan_modes) - 1)
+        scan_mode = min(2, len(scan_modes) - 1)
         print(f"\nUsing scan mode: {scan_mode}")
 
         scan_generator = lidar.start_scan_express(scan_mode)()  # Call the function to get generator
@@ -715,7 +786,7 @@ class PersonAlarmManager:
                         scan_started = True
                     
                     # Collect valid points
-                    if distance > 0 and quality > 0 and distance < (7 * 1000):
+                    if distance > 0 : #and quality > 0:
                         scan_points.append((angle, distance))
                     
                     # # Safety: if we have too many points, break
@@ -741,8 +812,6 @@ class PersonAlarmManager:
                     # Convert polar coordinates to Cartesian
                     angle_rad = math.radians(angle)
                     
-                   
-
                     real_x = float( (distance/1000.0) * math.cos(angle_rad)) 
                     real_y = float( (distance/1000.0) * math.sin(angle_rad)) 
 
@@ -751,10 +820,10 @@ class PersonAlarmManager:
                     scan_real_points.append((real_x, real_y))
                     
                     if self.lidar_debug_image:
-                        #Calculate x, y coordinates (invert y for image coordinates)
+                        # Calculate x, y coordinates (invert y for image coordinates)
                         x = int(self.CENTER + (distance / self.SCALE) * math.cos(angle_rad))
                         y = int(self.CENTER - (distance / self.SCALE) * math.sin(angle_rad))
-                        #Draw point if within image bounds
+                        # Draw point if within image bounds
                         if 0 <= x < self.IMAGE_SIZE and 0 <= y < self.IMAGE_SIZE:
                             scan_pixel_coords.append((x, y))
                             cv2.circle(image, (x, y), 2, (0, 0, 0), -1)
@@ -786,6 +855,9 @@ class PersonAlarmManager:
                 if self.is_map_calibrated and self.rotating_to_target_active == False and self.system_state == 'auto':
                     self.motion_points = self.collect_motion_points(scan_real_points)
                     
+                    # NEW: Cluster the motion points
+                    self.detected_clusters = self.cluster_motion_points(self.motion_points)
+                    
                     # Draw motion points as red circles
                     motion_count = 0
                     for i, (real_x, real_y) in enumerate(self.motion_points):
@@ -806,40 +878,39 @@ class PersonAlarmManager:
                     if motion_count > 0:
                         print('yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')
                         if self.lidar_debug_image:    
-                            motion_text = f"MOTION: {motion_count} points"
+                            motion_text = f"MOTION: {motion_count} points, {len(self.detected_clusters)} clusters"
                             cv2.putText(image, motion_text, (10, 120),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         
-                        # If significant motion detected, trigger alarm logic
-                        if motion_count > 20:  # Threshold for significant motion
-                            # Find the angle of the centroid of motion points
-                            motion_angles = []
-                            for real_x, real_y in self.motion_points:
-                                angle_to_point = math.degrees(math.atan2(real_y, real_x))
-                                motion_angles.append(angle_to_point)
+                        # If significant motion detected (at least one cluster), trigger alarm logic
+                        if len(self.detected_clusters) > 0:
+                            # Get the closest cluster (already sorted by distance to origin)
+                            closest_cluster = self.detected_clusters[0]
+                            center_x, center_y = closest_cluster['center']
                             
-                            if len(motion_angles) > 0:
-                                avg_angle = sum(motion_angles) / len(motion_angles)
-                                self.lidar_target_deg = avg_angle
-                                print(f"🎯 Motion detected at angle: {avg_angle:.1f}°")
+                            # Calculate angle to closest cluster center
+                            angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
+                            self.lidar_target_deg = angle_to_cluster
+                            print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° (distance: {closest_cluster['distance_to_origin']:.2f}m)")
                     else:
                         print('nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn')
-                # # Add text information
-                # if self.lidar_debug_image:    
-                #     cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                #     cv2.putText(image, f"Points: {valid_points}", (10, 60),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                #     cv2.putText(image, "Press 'q' to quit", (10, 90),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
                 
-                # # Display the image
+                # Add text information
+                if self.lidar_debug_image:    
+                    cv2.putText(image, f"Frame: {self.count_debug}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    cv2.putText(image, f"Points: {valid_points}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    cv2.putText(image, "Press 'q' to quit", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                
+                # Display the image
                 # cv2.imshow('LIDAR Scan', image)
-                # if self.lidar_debug_image:  
-                #     cv2.imwrite(f'/home/pi/person_alarm_ws/frames/{self.count_debug}.jpg', image)
-                #     self.count_debug += 1
+                if self.lidar_debug_image:  
+                    cv2.imwrite(f'/home/pi/person_alarm_ws/{self.count_debug}.jpg', image)
+                    self.count_debug += 1
                 
-                # # Break loop if 'q' is pressed
+                # Break loop if 'q' is pressed
                 # if cv2.waitKey(1) & 0xFF == ord('q'):
                 #     break
 
@@ -983,29 +1054,6 @@ class PersonAlarmManager:
             print(f"Failed to execute absolute tilt: {e}")
             return False
     
-    # def _execute_ptz_move(self, direction):
-    #     """
-    #     Execute PTZ move in a separate thread
-        
-    #     Args:
-    #         direction (str): 'left', 'right', 'up', 'down', or 'home'
-    #     """
-    #     with self.ptz_lock:
-    #         if direction == 'left':
-    #             new_pan = self.current_pan - self.pan_step
-    #             self.abs_pan(new_pan)
-    #         elif direction == 'right':
-    #             new_pan = self.current_pan + self.pan_step
-    #             self.abs_pan(new_pan)
-    #         elif direction == 'up':
-    #             new_tilt = self.current_tilt + self.tilt_step
-    #             self.abs_tilt(new_tilt)
-    #         elif direction == 'down':
-    #             new_tilt = self.current_tilt - self.tilt_step
-    #             self.abs_tilt(new_tilt)
-    #         elif direction == 'home':
-    #             self.go_home()
-    
     def go_home(self):
         print('go home')
         self.abs_pan(0.0, 1)
@@ -1122,12 +1170,36 @@ class PersonAlarmManager:
             return 0.0, 0.0, 0.0
 
     def publish_status(self):
-        """Publish current system status to MQTT"""
+        """Publish current system status to MQTT with static map and cluster data"""
         if not self.mqtt_connected or not self.mqtt_client:
             return
         
         try:
-            import json
+            # Prepare static map points (sample every Nth point to reduce size)
+            static_map_points = []
+            if self.is_map_calibrated and len(self.calibration_points) > 0:
+                # Sample points to avoid huge payloads (every 10th point)
+                sample_rate = max(1, len(self.calibration_points) // 1000)  # Max 1000 points
+                static_map_points = [
+                    {"x": float(pt[0]), "y": float(pt[1])} 
+                    for i, pt in enumerate(self.calibration_points) 
+                    if i % sample_rate == 0
+                ]
+            
+            # Prepare cluster data (already sorted by distance to origin)
+            clusters_data = []
+            for cluster in self.detected_clusters:
+                clusters_data.append({
+                    "center": {
+                        "x": cluster['center'][0],
+                        "y": cluster['center'][1]
+                    },
+                    "points": [
+                        {"x": float(pt[0]), "y": float(pt[1])} 
+                        for pt in cluster['points']
+                    ],
+                    "distance_to_origin": cluster['distance_to_origin']
+                })
             
             # Create status dictionary
             status = {
@@ -1138,6 +1210,8 @@ class PersonAlarmManager:
                 "rotating_to_target": self.rotating_to_target_active,
                 "current_pan": self.current_pan,
                 "current_tilt": self.current_tilt,
+                "static_map_points": static_map_points,
+                "clusters": clusters_data,
                 "timestamp": time.time()
             }
             
@@ -1147,6 +1221,8 @@ class PersonAlarmManager:
             
         except Exception as e:
             print(f"❌ Error publishing status: {e}")
+            import traceback
+            traceback.print_exc()
 
     def run(self):
      
@@ -1363,7 +1439,10 @@ def main():
     DETECTION_CONFIDENCE = 0.5   # Confidence threshold (0.0 to 1.0)
     
     # Motion detection settings
-    MOTION_THRESHOLD = 0.5 # Distance in meters (500mm) to consider as motion
+    MOTION_THRESHOLD = 0.5  # Distance in meters (500mm) to consider as motion
+    
+    # Clustering settings
+    CLUSTERING_MAX_DISTANCE = 0.2  # Max distance in meters between points in same cluster
  
     # Create manager instance
     manager = PersonAlarmManager(
@@ -1378,7 +1457,8 @@ def main():
         mqtt_port=MQTT_PORT,
         mqtt_topic=MQTT_TOPIC,
         mqtt_status_topic=MQTT_STATUS_TOPIC,
-        motion_threshold=MOTION_THRESHOLD
+        motion_threshold=MOTION_THRESHOLD,
+        clustering_max_distance=CLUSTERING_MAX_DISTANCE
     ) 
     
     try:

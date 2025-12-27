@@ -8,6 +8,8 @@ import paho.mqtt.client as mqtt
 import threading
 import time
 import json
+import numpy as np
+import math
 
 
 class Operator:
@@ -43,6 +45,15 @@ class Operator:
         # NEW: Status dictionary from camera
         self.status_dict = {}
         self.status_lock = threading.Lock()
+        
+        # NEW: View mode toggle
+        self.view_mode = "rtsp"  # "rtsp" or "map"
+        
+        # Map visualization parameters
+        self.map_image_size = 800
+        self.map_center = self.map_image_size // 2
+        self.map_scale = 100  # pixels per meter
+        self.max_distance = 4.0  # meters
         
         # Create main window
         self.root = tk.Tk()
@@ -91,6 +102,27 @@ class Operator:
             'relief': 'raised',
             'bd': 3
         }
+        
+        # NEW: View Mode Toggle button
+        self.view_mode_btn = tk.Button(
+            left_panel,
+            text="View Mode: RTSP",
+            command=self._toggle_view_mode,
+            font=('Arial', 12, 'bold'),
+            width=15,
+            height=2,
+            bg='#9b59b6',
+            fg='white',
+            activebackground='#8e44ad',
+            activeforeground='white',
+            relief='raised',
+            bd=3
+        )
+        self.view_mode_btn.pack(pady=10)
+        
+        # Separator
+        separator1 = ttk.Separator(left_panel, orient='horizontal')
+        separator1.pack(fill='x', pady=10)
         
         # Calibrate button
         self.calibrate_btn = tk.Button(
@@ -160,11 +192,11 @@ class Operator:
         )
         self.status_label.pack(side='bottom', pady=10)
         
-        # Center panel for video
+        # Center panel for video/map
         center_panel = tk.Frame(self.root, bg='black')
         center_panel.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
         
-        # Video label
+        # Video/Map label
         self.video_label = tk.Label(center_panel, bg='black')
         self.video_label.pack(expand=True, fill='both')
         
@@ -234,81 +266,94 @@ class Operator:
         Args:
             parent: Parent widget
             title: Title for the LabelFrame
-            status_key: Key in status dictionary to monitor
+            status_key: Key in status dictionary to display
             
         Returns:
-            Dictionary containing frame and label references
+            Dictionary with 'frame' and 'label' widgets
         """
+        # Create LabelFrame
         frame = tk.LabelFrame(
             parent,
             text=title,
-            font=('Arial', 11, 'bold'),
+            font=('Arial', 10, 'bold'),
             bg='#95a5a6',
             fg='white',
-            labelanchor='n',
             relief='ridge',
-            bd=3
+            bd=2
         )
-        frame.pack(pady=10, fill='x', padx=5)
+        frame.pack(fill='x', pady=5)
         
-        # Status value label
-        value_label = tk.Label(
+        # Create value label
+        label = tk.Label(
             frame,
-            text="Unknown",
-            font=('Arial', 10),
+            text='No Data',
+            font=('Arial', 11),
             bg='#95a5a6',
             fg='white',
             height=2
         )
-        value_label.pack(pady=10, padx=10)
+        label.pack(fill='both', padx=5, pady=5)
         
         return {
             'frame': frame,
-            'label': value_label,
+            'label': label,
             'key': status_key
         }
     
+    def _toggle_view_mode(self):
+        """Toggle between RTSP and Map view modes"""
+        if self.view_mode == "rtsp":
+            self.view_mode = "map"
+            self.view_mode_btn.config(text="View Mode: MAP")
+            print("🗺️  Switched to MAP view")
+        else:
+            self.view_mode = "rtsp"
+            self.view_mode_btn.config(text="View Mode: RTSP")
+            print("🎥 Switched to RTSP view")
+    
     def _update_status_display(self):
-        """Update status indicators based on received status dictionary"""
+        """Update status indicators based on current status dictionary"""
         with self.status_lock:
-            for status_name, status_info in self.status_frames.items():
-                key = status_info['key']
-                frame = status_info['frame']
-                label = status_info['label']
+            status = self.status_dict.copy()
+        
+        for status_frame in self.status_frames.values():
+            frame = status_frame['frame']
+            label = status_frame['label']
+            key = status_frame['key']
+            
+            if key in status:
+                value = status[key]
                 
-                if key in self.status_dict:
-                    value = self.status_dict[key]
-                    
-                    # Handle boolean values
-                    if isinstance(value, bool):
-                        if value:
-                            frame.config(bg='#2ecc71')  # Green
-                            label.config(bg='#2ecc71', text='✓ True')
-                        else:
-                            frame.config(bg='#e74c3c')  # Red
-                            label.config(bg='#e74c3c', text='✗ False')
-                    
-                    # Handle string values (like system_state)
-                    elif isinstance(value, str):
-                        if value.lower() == 'auto':
-                            frame.config(bg='#2ecc71')  # Green for auto
-                            label.config(bg='#2ecc71', text=f'✓ {value}')
-                        elif value.lower() == 'manual':
-                            frame.config(bg='#f39c12')  # Orange for manual
-                            label.config(bg='#f39c12', text=f'⚠ {value}')
-                        else:
-                            frame.config(bg='#3498db')  # Blue for other states
-                            label.config(bg='#3498db', text=value)
-                    
-                    # Handle other types
+                # Handle boolean values
+                if isinstance(value, bool):
+                    if value:
+                        frame.config(bg='#2ecc71')  # Green
+                        label.config(bg='#2ecc71', text='✓ YES')
                     else:
-                        frame.config(bg='#3498db')  # Blue for other values
-                        label.config(bg='#3498db', text=str(value))
-                        
+                        frame.config(bg='#e74c3c')  # Red
+                        label.config(bg='#e74c3c', text='✗ NO')
+                
+                # Handle string values
+                elif isinstance(value, str):
+                    if value.lower() in ['auto', 'active', 'ok', 'connected']:
+                        frame.config(bg='#2ecc71')  # Green
+                        label.config(bg='#2ecc71', text=value)
+                    elif value.lower() in ['manual', 'inactive', 'error', 'disconnected']:
+                        frame.config(bg='#f39c12')  # Orange
+                        label.config(bg='#f39c12', text=f'⚠ {value}')
+                    else:
+                        frame.config(bg='#3498db')  # Blue for other states
+                        label.config(bg='#3498db', text=value)
+                
+                # Handle other types
                 else:
-                    # Key not in status dict
-                    frame.config(bg='#95a5a6')  # Gray
-                    label.config(bg='#95a5a6', text='No Data')
+                    frame.config(bg='#3498db')  # Blue for other values
+                    label.config(bg='#3498db', text=str(value))
+                    
+            else:
+                # Key not in status dict
+                frame.config(bg='#95a5a6')  # Gray
+                label.config(bg='#95a5a6', text='No Data')
         
         # Schedule next update
         self.root.after(100, self._update_status_display)  # Update every 100ms
@@ -357,14 +402,14 @@ class Operator:
             if msg.topic == self.mqtt_status_topic:
                 # Parse JSON status dictionary
                 status_json = msg.payload.decode('utf-8')
-                print(f' status_json: { status_json }')
+                # print(f' status_json: { status_json }')
                 status_dict = json.loads(status_json)
                 
                 # Update local status dictionary
                 with self.status_lock:
                     self.status_dict = status_dict
                 
-                print(f"📥 Received status update: {status_dict}")
+                # print(f"📥 Received status update: {status_dict}")
                 
         except json.JSONDecodeError as e:
             print(f"❌ Failed to parse status JSON: {e}")
@@ -399,6 +444,110 @@ class Operator:
         if event.keysym in key_map:
             command = key_map[event.keysym]
             self._send_command(command)
+    
+    def _draw_map_view(self):
+        """
+        Generate map view image from static map points and clusters
+        
+        Returns:
+            numpy array: Image with map visualization
+        """
+        # Create white background
+        image = np.ones((self.map_image_size, self.map_image_size, 3), dtype=np.uint8) * 255
+        
+        with self.status_lock:
+            status = self.status_dict.copy()
+        
+        # Draw static map points (black dots)
+        if 'static_map_points' in status and len(status['static_map_points']) > 0:
+            for point in status['static_map_points']:
+                x = point['x']
+                y = point['y']
+                
+                # Convert to pixel coordinates
+                px = int(self.map_center + x * self.map_scale)
+                py = int(self.map_center - y * self.map_scale)
+                
+                # Draw if within bounds
+                if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
+                    cv2.circle(image, (px, py), 2, (0, 0, 0), -1)
+        
+        # Draw clusters
+        if 'clusters' in status and len(status['clusters']) > 0:
+            for i, cluster in enumerate(status['clusters']):
+                # First cluster (closest to origin) in RED, others in PURPLE
+                if i == 0:
+                    cluster_color = (0, 0, 255)  # Red in BGR
+                    center_color = (0, 0, 200)
+                else:
+                    cluster_color = (255, 0, 255)  # Purple/Magenta in BGR
+                    center_color = (200, 0, 200)
+                
+                # Draw cluster points
+                if 'points' in cluster:
+                    for point in cluster['points']:
+                        x = point['x']
+                        y = point['y']
+                        
+                        # Convert to pixel coordinates
+                        px = int(self.map_center + x * self.map_scale)
+                        py = int(self.map_center - y * self.map_scale)
+                        
+                        # Draw if within bounds
+                        if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
+                            cv2.circle(image, (px, py), 4, cluster_color, -1)
+                
+                # Draw cluster center with larger circle
+                if 'center' in cluster:
+                    cx = cluster['center']['x']
+                    cy = cluster['center']['y']
+                    
+                    # Convert to pixel coordinates
+                    cpx = int(self.map_center + cx * self.map_scale)
+                    cpy = int(self.map_center - cy * self.map_scale)
+                    
+                    # Draw if within bounds
+                    if 0 <= cpx < self.map_image_size and 0 <= cpy < self.map_image_size:
+                        # Draw center marker
+                        cv2.circle(image, (cpx, cpy), 10, center_color, 2)
+                        cv2.circle(image, (cpx, cpy), 3, center_color, -1)
+                        
+                        # Add label
+                        label = f"C{i+1}"
+                        cv2.putText(image, label, (cpx + 15, cpy - 15),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, center_color, 2)
+        
+        # Draw origin marker (0, 0)
+        cv2.drawMarker(image, (self.map_center, self.map_center), 
+                      (0, 0, 0), cv2.MARKER_CROSS, 20, 2)
+        cv2.putText(image, "Origin", (self.map_center + 15, self.map_center - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        # Draw scale reference
+        scale_length = int(1.0 * self.map_scale)  # 1 meter
+        cv2.line(image, (50, self.map_image_size - 50), 
+                (50 + scale_length, self.map_image_size - 50), (0, 0, 0), 2)
+        cv2.putText(image, "1m", (50, self.map_image_size - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # Add legend
+        legend_y = 30
+        cv2.putText(image, "Legend:", (10, legend_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        cv2.circle(image, (20, legend_y + 25), 3, (0, 0, 0), -1)
+        cv2.putText(image, "Static Map", (35, legend_y + 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        cv2.circle(image, (20, legend_y + 50), 5, (0, 0, 255), -1)
+        cv2.putText(image, "Cluster 1 (Closest)", (35, legend_y + 55),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        cv2.circle(image, (20, legend_y + 75), 5, (255, 0, 255), -1)
+        cv2.putText(image, "Other Clusters", (35, legend_y + 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        
+        return image
             
     def _start_video_stream(self):
         """Start video stream capture"""
@@ -442,42 +591,51 @@ class Operator:
                 time.sleep(0.1)
                 
     def _update_video_display(self):
-        """Update the video display in the UI"""
+        """Update the video/map display in the UI based on view mode"""
         if not self.running:
             return
+        
+        frame = None
+        
+        # Get frame based on view mode
+        if self.view_mode == "rtsp":
+            # Show RTSP video
+            with self.frame_lock:
+                if self.latest_frame is not None:
+                    frame = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
+        else:
+            # Show map view
+            map_image = self._draw_map_view()
+            frame = cv2.cvtColor(map_image, cv2.COLOR_BGR2RGB)
+        
+        if frame is not None:
+            # Resize to fit the display area
+            height, width = frame.shape[:2]
+            display_width = self.video_label.winfo_width()
+            display_height = self.video_label.winfo_height()
             
-        with self.frame_lock:
-            if self.latest_frame is not None:
-                # Convert frame to PhotoImage
-                frame = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
+            if display_width > 1 and display_height > 1:
+                # Calculate aspect ratio
+                aspect_ratio = width / height
                 
-                # Resize to fit the display area
-                height, width = frame.shape[:2]
-                display_width = self.video_label.winfo_width()
-                display_height = self.video_label.winfo_height()
+                if display_width / display_height > aspect_ratio:
+                    # Height is limiting factor
+                    new_height = display_height
+                    new_width = int(new_height * aspect_ratio)
+                else:
+                    # Width is limiting factor
+                    new_width = display_width
+                    new_height = int(new_width / aspect_ratio)
                 
-                if display_width > 1 and display_height > 1:
-                    # Calculate aspect ratio
-                    aspect_ratio = width / height
-                    
-                    if display_width / display_height > aspect_ratio:
-                        # Height is limiting factor
-                        new_height = display_height
-                        new_width = int(new_height * aspect_ratio)
-                    else:
-                        # Width is limiting factor
-                        new_width = display_width
-                        new_height = int(new_width / aspect_ratio)
-                    
-                    frame = cv2.resize(frame, (new_width, new_height))
-                
-                # Convert to PhotoImage
-                image = Image.fromarray(frame)
-                photo = ImageTk.PhotoImage(image=image)
-                
-                # Update label
-                self.video_label.config(image=photo)
-                self.video_label.image = photo  # Keep a reference
+                frame = cv2.resize(frame, (new_width, new_height))
+            
+            # Convert to PhotoImage
+            image = Image.fromarray(frame)
+            photo = ImageTk.PhotoImage(image=image)
+            
+            # Update label
+            self.video_label.config(image=photo)
+            self.video_label.image = photo  # Keep a reference
                 
         # Schedule next update
         self.root.after(30, self._update_video_display)  # ~30 FPS
