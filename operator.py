@@ -508,7 +508,7 @@ class Operator:
 
 def main():
     # Configuration
-    MQTT_BROKER = "localhost"  # Change to your MQTT broker address
+    MQTT_BROKER = '192.168.1.122' #"localhost"  # Change to your MQTT broker address
     MQTT_PORT = 1883
     MQTT_TOPIC = "camera/control"
     MQTT_STATUS_TOPIC = "camera/status"  # NEW: Status topic
