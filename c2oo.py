@@ -20,8 +20,8 @@ class PersonAlarmManager:
                  mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", mqtt_status_topic="camera/status",
                  motion_threshold=0.5):
 
-        #"/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic
-        self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
+        self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
+        #self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
         
         # MQTT settings
         self.mqtt_broker = mqtt_broker
@@ -814,14 +814,14 @@ class PersonAlarmManager:
                 cv2.putText(image, "Press 'q' to quit", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
                 
-                # Display the image
-                cv2.imshow('LIDAR Scan', image)
+                # # Display the image
+                # cv2.imshow('LIDAR Scan', image)
                 
-                frame_count += 1
+                # frame_count += 1
                 
-                # Break loop if 'q' is pressed
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                # # Break loop if 'q' is pressed
+                # if cv2.waitKey(1) & 0xFF == ord('q'):
+                #     break
 
         except KeyboardInterrupt:
             self.lidar_port_ok = False
