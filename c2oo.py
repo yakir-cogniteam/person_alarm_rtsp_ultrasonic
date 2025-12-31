@@ -20,7 +20,7 @@ class PersonAlarmManager:
                  pan_speed=0.5, tilt_speed=0.5, enable_detection=True, detection_confidence=0.2,
                  mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", 
                  mqtt_status_topic="camera/status", mqtt_lidar_topic="lidar/scan",
-                 motion_threshold=0.5, clustering_max_distance=0.2):
+                 motion_threshold=0.5, clustering_max_distance=0.4):
 
         self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
         #self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -52,7 +52,7 @@ class PersonAlarmManager:
         self.calibration_cmd = False
         self.is_calibration_active = False
         self.calibration_count = 0
-        self.MAX_CALIBRATION_COUNT = 100      
+        self.MAX_CALIBRATION_COUNT = 20      
 
         # NEW: KDTree and motion detection members
         self.calibration_points = []  # List to store 2D points during calibration
@@ -76,7 +76,7 @@ class PersonAlarmManager:
         self.min_pan_deg = -180
         self.max_pan_deg = 180 
         self.conut_frame_for_detect = 0
-        self.MAX_FRAMES_DETECTION = 20
+        self.MAX_FRAMES_DETECTION = 5
         
         # Step sizes for arrow key adjustments
         self.pan_step = pan_step
@@ -339,25 +339,27 @@ class PersonAlarmManager:
                     print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
             
             # MOTION DETECTION: After calibration, detect motion points
-            if self.is_map_calibrated and not self.rotating_to_target_active and self.system_state == 'auto':
-                self.motion_points = self.collect_motion_points(scan_real_points)
-                
-                # Cluster the motion points
-                self.detected_clusters = self.cluster_motion_points(self.motion_points)
-                
-                if len(self.detected_clusters) > 0:
-                    # Get the closest cluster (already sorted by distance to origin)
-                    closest_cluster = self.detected_clusters[0]
-                    center_x, center_y = closest_cluster['center']
-                    points_cluster = closest_cluster['points']
+            if self.is_map_calibrated and  self.system_state == 'auto' and not self.rotating_to_target_active:
+                motion_points = self.collect_motion_points(scan_real_points)
+                if  len(motion_points) > 0 :
+                    print(f'found motions {len(motion_points)}')
+                    # Cluster the motion points
+                    self.detected_clusters = self.cluster_motion_points(motion_points)
                     
-                    if len(points_cluster) > 5:
-                        # Calculate angle to closest cluster center
-                        angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
-                        self.lidar_target_deg = angle_to_cluster
-                        print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° "
-                              f"(distance: {closest_cluster['distance_to_origin']:.2f}m, "
-                              f"points: {len(points_cluster)})")
+                    if len(self.detected_clusters) > 0:
+                        print('found clusters !!')
+                        # Get the closest cluster (already sorted by distance to origin)
+                        closest_cluster = self.detected_clusters[0]
+                        center_x, center_y = closest_cluster['center']
+                        points_cluster = closest_cluster['points']
+                        
+                        if len(points_cluster) > 2:
+                            # Calculate angle to closest cluster center
+                            angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
+                            self.lidar_target_deg = angle_to_cluster
+                            print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° "
+                                f"(distance: {closest_cluster['distance_to_origin']:.2f}m, "
+                                f"points: {len(points_cluster)})")
                 
         except Exception as e:
             print(f"❌ Error processing scan data: {e}")
@@ -429,91 +431,84 @@ class PersonAlarmManager:
             return None
     
     def collect_motion_points(self, scan_points):
-        """
-        Collect all 2D points from scan that are above the motion threshold
-        
-        Args:
-            scan_points: List of (real_x, real_y) tuples from the current scan
-            
-        Returns:
-            motion_points: List of (real_x, real_y) tuples that exceed threshold
-        """
         if not self.is_map_calibrated or self.kdtree is None:
             return []
-        
+
         motion_points = []
         for real_x, real_y in scan_points:
             distance = self.get_distance_to_nearest_point(real_x, real_y)
+
             if distance is not None and distance > self.motion_threshold:
                 motion_points.append((real_x, real_y))
-        
+
         return motion_points
+
     
     def cluster_motion_points(self, motion_points):
         """
         Cluster motion points using DBSCAN algorithm
-        
-        Args:
-            motion_points: List of (real_x, real_y) tuples representing motion
-            
+
         Returns:
             clusters: List of dictionaries, each containing:
-                     - 'points': numpy array of points in cluster
-                     - 'center': (x, y) tuple of cluster center
-                     - 'distance_to_origin': distance from (0,0)
-                     Sorted by distance to origin (closest first)
+                    - 'points': list of points in cluster
+                    - 'center': (x, y) tuple of cluster center
+                    - 'distance_to_origin': distance from (0,0)
+                    - 'num_points': number of points in cluster
+            Sorted by number of points (largest first)
         """
         if len(motion_points) == 0:
             return []
-        
+
         try:
-            # Convert to numpy array
             points_array = np.array(motion_points)
-            
-            # DBSCAN clustering
-            # eps = maximum distance between two points to be in same cluster
-            # min_samples = minimum number of points to form a cluster
-            clustering = DBSCAN(eps=self.clustering_max_distance, min_samples=3).fit(points_array)
-            
+
+            clustering = DBSCAN(
+                eps=self.clustering_max_distance,
+                min_samples=3
+            ).fit(points_array)
+
             labels = clustering.labels_
-            
-            # Group points by cluster
+
             clusters = []
             unique_labels = set(labels)
-            
+
             for label in unique_labels:
-                if label == -1:  # Skip noise points
+                if label == -1:  # Skip noise
                     continue
-                
-                # Get all points in this cluster
+
                 cluster_mask = labels == label
                 cluster_points = points_array[cluster_mask]
-                
-                # Calculate cluster center
+
+                # Center
                 center_x = np.mean(cluster_points[:, 0])
                 center_y = np.mean(cluster_points[:, 1])
                 center = (float(center_x), float(center_y))
-                
-                # Calculate distance to origin
+
+                # Distance to origin
                 distance_to_origin = math.sqrt(center_x**2 + center_y**2)
-                
+
                 clusters.append({
-                    'points': cluster_points.tolist(),  # Convert to list for JSON serialization
+                    'points': cluster_points.tolist(),
                     'center': center,
-                    'distance_to_origin': distance_to_origin
+                    'distance_to_origin': distance_to_origin,
+                    'num_points': len(cluster_points)
                 })
-            
-            # Sort clusters by distance to origin (closest first)
-            clusters.sort(key=lambda c: c['distance_to_origin'])
-            
-            if len(clusters) > 0:
-                print(f"🔍 Found {len(clusters)} clusters from {len(motion_points)} motion points")
-            
+
+            # ✅ Sort by cluster size (largest first)
+            clusters.sort(key=lambda c: c['num_points'], reverse=True)
+
+            if clusters:
+                print(
+                    f"🔍 Found {len(clusters)} clusters "
+                    f"(largest has {clusters[0]['num_points']} points)"
+                )
+
             return clusters
-            
+
         except Exception as e:
             print(f"❌ Error clustering motion points: {e}")
             return []
+
     
     def play_beep(self):
         file_path = self.ws_path + "/sounds/beep.wav"
@@ -1065,7 +1060,8 @@ class PersonAlarmManager:
                 self.lidar_target_deg = None
                 pan, tilt, zoom = self.get_current_ptz()
                 
-                if math.fabs(self.wanted_pan - pan) < 0.05:
+                if math.fabs(self.wanted_pan - pan) < 0.1:
+                    print('ffffffffffffffffffffffffffffff')
                     self.conut_frame_for_detect += 1
 
                     if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
@@ -1099,6 +1095,7 @@ class PersonAlarmManager:
                 
             elif self.lidar_target_deg is not None:
                 self.rotate_to_target(self.lidar_target_deg)
+                print('rrrrrrrrrrrrrrrrrrrrrrrrrrrotatting  ')
                 self.lidar_target_deg = None
                 self.rotating_to_target_active = True
             
