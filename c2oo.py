@@ -1059,21 +1059,24 @@ class PersonAlarmManager:
             if self.rotating_to_target_active:
                 pan, tilt, zoom = self.get_current_ptz()
                 
-                if math.fabs(self.wanted_pan - pan) < 0.1:
+                if self.wanted_pan  == None:
+                    self.conut_frame_for_detect = 0
+                    self.rotating_to_target_active = False
+                    self.enable_detection = False
+                    self.detection_active = False
+                    self.go_home()
+
+                elif math.fabs(self.wanted_pan - pan) < 0.1:
                     print('ffffffffffffffffffffffffffffff')
                     self.conut_frame_for_detect += 1
-
-                    if self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
-                        self.rotating_to_target_active = False
-                        self.conut_frame_for_detect = 0
+                    print(f' self.conut_frame_for_detect {self.conut_frame_for_detect}')                   
+                    
 
                     self.enable_detection = True
                     self.detection_active = True
                     detections = self._detect_persons(frame)
                     
-                    if len(detections) > 0:
-                        self.rotating_to_target_active = False
-                        self.conut_frame_for_detect = 0
+                    if len(detections) > 0 and self.conut_frame_for_detect <= self.MAX_FRAMES_DETECTION:
                         
                         print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
                         
@@ -1084,13 +1087,23 @@ class PersonAlarmManager:
                         # time.sleep(0.1)
                         # self.play_beep()
 
+                        self.conut_frame_for_detect = 0
+                        self.rotating_to_target_active = False
                         self.enable_detection = False
                         self.detection_active = False
+                        self.wanted_pan = None
                         self.go_home()
-                    else:
-                        self.rotating_to_target_active = False    
-                        print('⚠️  No person detected at target location') 
-                        self.go_home() 
+                    
+                    elif self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
+                        self.conut_frame_for_detect = 0
+                        self.rotating_to_target_active = False  
+                        self.enable_detection = False
+                        self.detection_active = False  
+                        self.wanted_pan = None
+
+                        print('⚠️  No person detected at target location. go home') 
+                        self.go_home()     
+                       
                 
             elif self.lidar_target_deg is not None:
                 self.rotating_to_target_active = True
