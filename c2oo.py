@@ -339,7 +339,7 @@ class PersonAlarmManager:
                     print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
             
             # MOTION DETECTION: After calibration, detect motion points
-            if self.is_map_calibrated and  self.system_state == 'auto' : # and not self.rotating_to_target_active:
+            if self.is_map_calibrated and  self.system_state == 'auto' and not self.rotating_to_target_active and self.enable_detection == False and self.detection_active = False:
                 motion_points = self.collect_motion_points(scan_real_points)
                 if  len(motion_points) > 0 :
                     print(f'found motions {len(motion_points)}')
@@ -570,9 +570,9 @@ class PersonAlarmManager:
             # Resize for faster processing on Raspberry Pi
             # Use smaller input size for better performance
             blob = cv2.dnn.blobFromImage(
-                cv2.resize(frame, (300, 300)),
+                cv2.resize(frame, (150, 150)),
                 0.007843,  # Scale factor
-                (300, 300),
+                (150, 150),
                 127.5  # Mean subtraction
             )
             
@@ -1057,7 +1057,6 @@ class PersonAlarmManager:
             
             # Camera rotation and detection logic
             if self.rotating_to_target_active:
-                self.lidar_target_deg = None
                 pan, tilt, zoom = self.get_current_ptz()
                 
                 if math.fabs(self.wanted_pan - pan) < 0.1:
@@ -1082,8 +1081,8 @@ class PersonAlarmManager:
                         self.play_beep()
                         time.sleep(0.1)
                         self.play_beep()
-                        time.sleep(0.1)
-                        self.play_beep()
+                        # time.sleep(0.1)
+                        # self.play_beep()
 
                         self.enable_detection = False
                         self.detection_active = False
@@ -1094,10 +1093,10 @@ class PersonAlarmManager:
                         self.go_home() 
                 
             elif self.lidar_target_deg is not None:
+                self.rotating_to_target_active = True
                 self.rotate_to_target(self.lidar_target_deg)
                 print('rrrrrrrrrrrrrrrrrrrrrrrrrrrotatting  ')
                 self.lidar_target_deg = None
-                self.rotating_to_target_active = True
             
             # Manual mode override
             if self.system_state == 'manual' and self.rotating_to_target_active:
