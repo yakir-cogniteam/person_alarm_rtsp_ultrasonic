@@ -339,7 +339,7 @@ class PersonAlarmManager:
                     print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
             
             # MOTION DETECTION: After calibration, detect motion points
-            if self.is_map_calibrated and  self.system_state == 'auto' : and not self.rotating_to_target_active:
+            if self.is_map_calibrated and  self.system_state == 'auto' : # and not self.rotating_to_target_active:
                 motion_points = self.collect_motion_points(scan_real_points)
                 if  len(motion_points) > 0 :
                     print(f'found motions {len(motion_points)}')
