@@ -495,7 +495,7 @@ class Operator:
                 
                 # Draw if within bounds
                 if 0 <= px < self.map_image_size and 0 <= py < self.map_image_size:
-                    cv2.circle(image, (px, py), 2, (200, 200, 200), -1)  # Light gray
+                    cv2.circle(image, (px, py), 10, (255, 0, 255), -1)  # Light gray
         
         # LAYER 2: Draw current LiDAR scan points (BLUE - live data)
         if lidar_scan and 'points' in lidar_scan:

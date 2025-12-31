@@ -58,7 +58,6 @@ class PersonAlarmManager:
         self.calibration_points = []  # List to store 2D points during calibration
         self.kdtree = None  # KDTree structure for fast nearest neighbor queries
         self.motion_threshold = motion_threshold  # Distance threshold in meters (e.g., 0.5)
-        self.motion_points = []  # List to store detected motion points in current frame      
 
         # NEW: Clustering parameters
         self.clustering_max_distance = clustering_max_distance  # Max distance between points in same cluster
@@ -325,6 +324,7 @@ class PersonAlarmManager:
                 self.is_calibration_active = True
                 self.calibration_points = []  # Reset calibration points
                 self.calibration_count = 0
+                self.detected_clusters = [] 
             
             if self.is_calibration_active:
                 for real_x, real_y in scan_real_points:
@@ -339,7 +339,7 @@ class PersonAlarmManager:
                     print(f"🎯 Calibration complete! Map calibrated: {self.is_map_calibrated}")
             
             # MOTION DETECTION: After calibration, detect motion points
-            if self.is_map_calibrated and  self.system_state == 'auto' and not self.rotating_to_target_active:
+            if self.is_map_calibrated and  self.system_state == 'auto' : and not self.rotating_to_target_active:
                 motion_points = self.collect_motion_points(scan_real_points)
                 if  len(motion_points) > 0 :
                     print(f'found motions {len(motion_points)}')
