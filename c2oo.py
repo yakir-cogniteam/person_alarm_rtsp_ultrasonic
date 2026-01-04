@@ -75,7 +75,7 @@ class PersonAlarmManager:
         self.min_pan_deg = -180
         self.max_pan_deg = 180 
         self.conut_frame_for_detect = 0
-        self.MAX_FRAMES_DETECTION = 5
+        self.MAX_FRAMES_DETECTION = 1
         
         # Step sizes for arrow key adjustments
         self.pan_step = pan_step
@@ -342,24 +342,22 @@ class PersonAlarmManager:
             if self.is_map_calibrated and  self.system_state == 'auto' and not self.rotating_to_target_active:
                 motion_points = self.collect_motion_points(scan_real_points)
                 if  len(motion_points) > 0 :
-                    print(f'found motions {len(motion_points)}')
                     # Cluster the motion points
                     self.detected_clusters = self.cluster_motion_points(motion_points)
                     
                     if len(self.detected_clusters) > 0:
-                        print('found clusters !!')
                         # Get the closest cluster (already sorted by distance to origin)
                         closest_cluster = self.detected_clusters[0]
                         center_x, center_y = closest_cluster['center']
                         points_cluster = closest_cluster['points']
                         
-                        if len(points_cluster) > 2:
+                        if len(points_cluster) > 3:
                             # Calculate angle to closest cluster center
                             angle_to_cluster = math.degrees(math.atan2(center_y, center_x))
                             self.lidar_target_deg = angle_to_cluster
-                            print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° "
-                                f"(distance: {closest_cluster['distance_to_origin']:.2f}m, "
-                                f"points: {len(points_cluster)})")
+                            # print(f"🎯 Motion cluster detected at angle: {angle_to_cluster:.1f}° "
+                            #     f"(distance: {closest_cluster['distance_to_origin']:.2f}m, "
+                            #     f"points: {len(points_cluster)})")
                 
         except Exception as e:
             print(f"❌ Error processing scan data: {e}")
@@ -1065,10 +1063,10 @@ class PersonAlarmManager:
                     self.enable_detection = False
                     self.detection_active = False
                     self.go_home()
+                    
 
-                elif math.fabs(self.wanted_pan - pan) < 0.1:
+                elif math.fabs(self.wanted_pan - pan) < 0.03:
                     print('ffffffffffffffffffffffffffffff')
-                    self.conut_frame_for_detect += 1
                     print(f' self.conut_frame_for_detect {self.conut_frame_for_detect}')                   
                     
 
@@ -1076,23 +1074,22 @@ class PersonAlarmManager:
                     self.detection_active = True
                     detections = self._detect_persons(frame)
                     
-                    if len(detections) > 0 and self.conut_frame_for_detect <= self.MAX_FRAMES_DETECTION:
+                    if len(detections) > 0:
+                        print('found person!!')
+    
+                        if self.conut_frame_for_detect <= self.MAX_FRAMES_DETECTION:
                         
-                        print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
-                        
-                        # Triple beep alarm
-                        self.play_beep()
-                        time.sleep(0.1)
-                        self.play_beep()
-                        # time.sleep(0.1)
-                        # self.play_beep()
+                            print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
+                            
+                            # Triple beep alarm
+                            self.play_beep()                         
 
-                        self.conut_frame_for_detect = 0
-                        self.rotating_to_target_active = False
-                        self.enable_detection = False
-                        self.detection_active = False
-                        self.wanted_pan = None
-                        self.go_home()
+
+                            self.conut_frame_for_detect = 0
+                            self.rotating_to_target_active = False
+                            self.enable_detection = False
+                            self.detection_active = False
+                            self.wanted_pan = None
                     
                     elif self.conut_frame_for_detect > self.MAX_FRAMES_DETECTION:        
                         self.conut_frame_for_detect = 0
@@ -1100,15 +1097,17 @@ class PersonAlarmManager:
                         self.enable_detection = False
                         self.detection_active = False  
                         self.wanted_pan = None
+                        self.go_home()     
+
 
                         print('⚠️  No person detected at target location. go home') 
-                        self.go_home()     
-                       
+                    
+                    self.conut_frame_for_detect += 1
+   
                 
             elif self.lidar_target_deg is not None:
                 self.rotating_to_target_active = True
                 self.rotate_to_target(self.lidar_target_deg)
-                print('rrrrrrrrrrrrrrrrrrrrrrrrrrrotatting  ')
                 self.lidar_target_deg = None
             
             # Manual mode override
