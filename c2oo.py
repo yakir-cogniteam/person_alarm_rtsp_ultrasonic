@@ -570,9 +570,9 @@ class PersonAlarmManager:
             # Resize for faster processing on Raspberry Pi
             # Use smaller input size for better performance
             blob = cv2.dnn.blobFromImage(
-                cv2.resize(frame, (150, 150)),
+                cv2.resize(frame, (300, 300)),
                 0.007843,  # Scale factor
-                (150, 150),
+                (300, 300),
                 127.5  # Mean subtraction
             )
             

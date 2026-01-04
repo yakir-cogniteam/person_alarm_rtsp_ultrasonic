@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import cv2
 from PIL import Image, ImageTk
 import paho.mqtt.client as mqtt
@@ -10,6 +10,142 @@ import time
 import json
 import numpy as np
 import math
+
+
+class ConfigDialog:
+    def __init__(self):
+        """Initialize the configuration dialog"""
+        self.camera_ip = None
+        self.pi_ip = None
+        self.confirmed = False
+        
+        # Create dialog window
+        self.dialog = tk.Tk()
+        self.dialog.title("Configuration")
+        self.dialog.geometry("400x250")
+        self.dialog.resizable(False, False)
+        
+        # Center the window
+        self.dialog.update_idletasks()
+        width = self.dialog.winfo_width()
+        height = self.dialog.winfo_height()
+        x = (self.dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (height // 2)
+        self.dialog.geometry(f'{width}x{height}+{x}+{y}')
+        
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        """Setup the configuration dialog UI"""
+        # Main frame with padding
+        main_frame = tk.Frame(self.dialog, bg='#ecf0f1', padx=20, pady=20)
+        main_frame.pack(fill='both', expand=True)
+        
+        # Title
+        title_label = tk.Label(
+            main_frame,
+            text="Network Configuration",
+            font=('Arial', 16, 'bold'),
+            bg='#ecf0f1',
+            fg='#2c3e50'
+        )
+        title_label.pack(pady=(0, 20))
+        
+        # Camera IP input
+        camera_frame = tk.Frame(main_frame, bg='#ecf0f1')
+        camera_frame.pack(fill='x', pady=10)
+        
+        camera_label = tk.Label(
+            camera_frame,
+            text="Camera IP:",
+            font=('Arial', 12),
+            bg='#ecf0f1',
+            fg='#2c3e50',
+            width=12,
+            anchor='w'
+        )
+        camera_label.pack(side='left')
+        
+        self.camera_entry = tk.Entry(
+            camera_frame,
+            font=('Arial', 12),
+            width=20
+        )
+        self.camera_entry.pack(side='left', padx=(10, 0))
+        self.camera_entry.insert(0, "192.168.1.143")  # Default value
+        
+        # PI IP input
+        pi_frame = tk.Frame(main_frame, bg='#ecf0f1')
+        pi_frame.pack(fill='x', pady=10)
+        
+        pi_label = tk.Label(
+            pi_frame,
+            text="Pi IP:",
+            font=('Arial', 12),
+            bg='#ecf0f1',
+            fg='#2c3e50',
+            width=12,
+            anchor='w'
+        )
+        pi_label.pack(side='left')
+        
+        self.pi_entry = tk.Entry(
+            pi_frame,
+            font=('Arial', 12),
+            width=20
+        )
+        self.pi_entry.pack(side='left', padx=(10, 0))
+        self.pi_entry.insert(0, "192.168.1.122")  # Default value
+        
+        # Confirm button
+        confirm_btn = tk.Button(
+            main_frame,
+            text="Confirm",
+            command=self._on_confirm,
+            font=('Arial', 12, 'bold'),
+            bg='#3498db',
+            fg='white',
+            activebackground='#2980b9',
+            activeforeground='white',
+            width=15,
+            height=2,
+            relief='raised',
+            bd=3,
+            cursor='hand2'
+        )
+        confirm_btn.pack(pady=20)
+        
+        # Bind Enter key to confirm
+        self.dialog.bind('<Return>', lambda e: self._on_confirm())
+        
+        # Focus on camera entry
+        self.camera_entry.focus()
+        
+    def _on_confirm(self):
+        """Handle confirm button click"""
+        camera_ip = self.camera_entry.get().strip()
+        pi_ip = self.pi_entry.get().strip()
+        
+        # Basic validation
+        if not camera_ip or not pi_ip:
+            messagebox.showwarning(
+                "Invalid Input",
+                "Please enter both IP addresses!"
+            )
+            return
+        
+        # Store values
+        self.camera_ip = camera_ip
+        self.pi_ip = pi_ip
+        self.confirmed = True
+        
+        # Close dialog
+        self.dialog.destroy()
+        
+    def show(self):
+        """Show the dialog and wait for user input"""
+        self.dialog.mainloop()
+        return self.confirmed, self.camera_ip, self.pi_ip
 
 
 class Operator:
@@ -576,7 +712,7 @@ class Operator:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
         
         # Static map
-        cv2.circle(image, (20, legend_y + 25), 3, (200, 200, 200), -1)
+        cv2.circle(image, (20, legend_y + 25), 3, (255, 0, 255), -1)
         cv2.putText(image, "Static Map (Calibration)", (35, legend_y + 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
@@ -585,15 +721,7 @@ class Operator:
         cv2.putText(image, "Current Scan (Live)", (35, legend_y + 55),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # Cluster 1
-        cv2.circle(image, (20, legend_y + 75), 5, (0, 0, 255), -1)
-        cv2.putText(image, "Motion Cluster (Closest)", (35, legend_y + 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        # Other clusters
-        cv2.circle(image, (20, legend_y + 100), 5, (255, 0, 255), -1)
-        cv2.putText(image, "Other Motion Clusters", (35, legend_y + 105),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+  
         
         # Display scan info if available
         if lidar_scan:
@@ -724,24 +852,35 @@ class Operator:
 
 
 def main():
+    # Show configuration dialog
+    config_dialog = ConfigDialog()
+    confirmed, camera_ip, pi_ip = config_dialog.show()
+    
+    # If user didn't confirm, exit
+    if not confirmed:
+        print("❌ Configuration cancelled. Exiting...")
+        return
+    
+    print(f"✅ Configuration confirmed:")
+    print(f"   Camera IP: {camera_ip}")
+    print(f"   Pi IP: {pi_ip}")
+    
     # Configuration
-    MQTT_BROKER = '192.168.1.122'  # Change to your MQTT broker address
     MQTT_PORT = 1883
     MQTT_TOPIC = "camera/control"
     MQTT_STATUS_TOPIC = "camera/status"
     MQTT_LIDAR_TOPIC = "lidar/scan"  # NEW: LiDAR scan topic
     
     # RTSP URL (same as PersonAlarmManager uses)
-    # Update with your camera's RTSP URL
-    RTSP_URL = "rtsp://admin123:admin123@192.168.1.143:554/stream1"
+    RTSP_URL = f'rtsp://admin123:admin123@{camera_ip}:554/stream1'
     
     # Create and run operator interface
     operator = Operator(
-        mqtt_broker=MQTT_BROKER,
+        mqtt_broker=pi_ip,
         mqtt_port=MQTT_PORT,
         mqtt_topic=MQTT_TOPIC,
         mqtt_status_topic=MQTT_STATUS_TOPIC,
-        mqtt_lidar_topic=MQTT_LIDAR_TOPIC,  # NEW
+        mqtt_lidar_topic=MQTT_LIDAR_TOPIC,  
         rtsp_url=RTSP_URL
     )
     
@@ -750,3 +889,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#  CAMERA_IP =   '192.168.1.143'
+#     PI_IP = '192.168.1.122'  # Change to your MQTT broker address
