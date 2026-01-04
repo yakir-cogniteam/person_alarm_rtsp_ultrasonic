@@ -75,7 +75,7 @@ class PersonAlarmManager:
         self.min_pan_deg = -180
         self.max_pan_deg = 180 
         self.conut_frame_for_detect = 0
-        self.MAX_FRAMES_DETECTION = 1
+        self.MAX_FRAMES_DETECTION = 2
         
         # Step sizes for arrow key adjustments
         self.pan_step = pan_step
@@ -509,7 +509,7 @@ class PersonAlarmManager:
 
     
     def play_beep(self):
-        file_path = self.ws_path + "/sounds/beep.wav"
+        file_path = '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/sounds/beep.wav'
     
         try:
             # Open the WAV file
@@ -1072,7 +1072,10 @@ class PersonAlarmManager:
 
                     self.enable_detection = True
                     self.detection_active = True
+                    print('febore detect')
                     detections = self._detect_persons(frame)
+                    print('after detect')
+
                     
                     if len(detections) > 0:
                         print('found person!!')
@@ -1082,7 +1085,9 @@ class PersonAlarmManager:
                             print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
                             
                             # Triple beep alarm
-                            self.play_beep()                         
+                            self.play_beep()   
+
+                            # exit(1)                      
 
 
                             self.conut_frame_for_detect = 0
@@ -1107,6 +1112,7 @@ class PersonAlarmManager:
                 
             elif self.lidar_target_deg is not None:
                 self.rotating_to_target_active = True
+                self.conut_frame_for_detect = 0
                 self.rotate_to_target(self.lidar_target_deg)
                 self.lidar_target_deg = None
             
