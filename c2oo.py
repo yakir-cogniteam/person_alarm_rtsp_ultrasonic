@@ -14,6 +14,8 @@ import paho.mqtt.client as mqtt
 from scipy.spatial import KDTree
 import json
 from sklearn.cluster import DBSCAN
+import subprocess
+
 
 class PersonAlarmManager:
     def __init__(self, camera_ip, username, password, port=2020, pan_step=0.01, tilt_step=0.01, 
@@ -21,6 +23,9 @@ class PersonAlarmManager:
                  mqtt_broker="localhost", mqtt_port=1883, mqtt_topic="camera/control", 
                  mqtt_status_topic="camera/status", mqtt_lidar_topic="lidar/scan",
                  motion_threshold=0.5, clustering_max_distance=0.4):
+
+
+        self.turn_off_leds()
 
         self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
         #self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -129,7 +134,35 @@ class PersonAlarmManager:
             if(self._init_person_detector() == False):
                 exit(-1)
     
+
+    def turn_off_leds(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/pixel_leds.py', '0', '0.5'],
+            capture_output=True,
+            text=True
+        )
+
+    def turn_on_search_targets_leds(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/pixel_leds.py', '1', '0.5'],
+            capture_output=True,
+            text=True
+        )
+
+    def turn_on_alarm_leds(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/pixel_leds.py', '2', '0.5'],
+            capture_output=True,
+            text=True
+        )
+
     def disconnect(self):
+
+        self.turn_off_leds()
+
         """Clean up and disconnect"""
         print("🛑 Stopping all threads...")
         self.running = False
@@ -1063,10 +1096,11 @@ class PersonAlarmManager:
                     self.enable_detection = False
                     self.detection_active = False
                     self.go_home()
+                    self.turn_off_leds()
+
                     
 
                 elif math.fabs(self.wanted_pan - pan) < 0.03:
-                    print('ffffffffffffffffffffffffffffff')
                     print(f' self.conut_frame_for_detect {self.conut_frame_for_detect}')                   
                     
 
@@ -1087,8 +1121,7 @@ class PersonAlarmManager:
                             # Triple beep alarm
                             self.play_beep()   
 
-                            # exit(1)                      
-
+                            self.turn_on_alarm_leds()
 
                             self.conut_frame_for_detect = 0
                             self.rotating_to_target_active = False
@@ -1102,7 +1135,9 @@ class PersonAlarmManager:
                         self.enable_detection = False
                         self.detection_active = False  
                         self.wanted_pan = None
-                        self.go_home()     
+                        self.go_home()
+                        self.turn_off_leds()
+     
 
 
                         print('⚠️  No person detected at target location. go home') 
@@ -1115,6 +1150,8 @@ class PersonAlarmManager:
                 self.conut_frame_for_detect = 0
                 self.rotate_to_target(self.lidar_target_deg)
                 self.lidar_target_deg = None
+                self.turn_on_search_targets_leds()
+
             
             # Manual mode override
             if self.system_state == 'manual' and self.rotating_to_target_active:
@@ -1206,6 +1243,7 @@ def main():
     finally:
         # Clean up
         print("🧹 Cleaning up...")
+
         manager.disconnect()
         print("👋 Goodbye!")
 
