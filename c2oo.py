@@ -1180,7 +1180,7 @@ class PersonAlarmManager:
 
 def main():
     # Camera configuration - Update these values
-    CAMERA_IP = "192.168.1.143"
+    CAMERA_IP = "192.168.12.140"
     USERNAME = "admin123"
     PASSWORD = "admin123"
     
