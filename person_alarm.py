@@ -143,6 +143,14 @@ class PersonAlarmManager:
             text=True
         )
 
+    def play_beep_procces(self):
+
+        result = subprocess.run(
+            ['python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/play_beep.py'],
+            capture_output=True,
+            text=True
+        )
+
     def turn_on_manual_leds(self):
 
         result = subprocess.run(
@@ -421,7 +429,7 @@ class PersonAlarmManager:
             time.sleep(1.0)  # Check every second
     
     def sound_test(self):
-        self.play_beep()
+        self.play_beep_procces()
     
     def switch_state(self):
         if self.system_state == 'manual':
@@ -555,42 +563,7 @@ class PersonAlarmManager:
             return []
 
     
-    def play_beep(self):
-        file_path = '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/sounds/beep.wav'
     
-        try:
-            # Open the WAV file
-            wf = wave.open(file_path, 'rb')
-            
-            # Create PyAudio instance
-            p = pyaudio.PyAudio()
-            
-            # Open stream
-            stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                            channels=wf.getnchannels(),
-                            rate=wf.getframerate(),
-                            output=True)
-            
-            # Read and play data in chunks
-            chunk_size = 1024
-            data = wf.readframes(chunk_size)
-            
-            print(f"🔊 Playing beep")
-            
-            while data:
-                stream.write(data)
-                data = wf.readframes(chunk_size)
-            
-            # Cleanup
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            wf.close()
-            
-        except FileNotFoundError:
-            print(f"❌ Error: File '{file_path}' not found")
-        except Exception as e:
-            print(f"❌ Error playing audio: {e}")
     
     def _detect_persons(self, frame):
         """
@@ -680,6 +653,8 @@ class PersonAlarmManager:
             # Setup MQTT server
             self._setup_mqtt()
             
+            self.go_home()
+
             print("Successfully connected to Tapo C200")
             return True
             
@@ -1133,8 +1108,11 @@ class PersonAlarmManager:
                             print(f"🚨 PERSON DETECTED! Confidence: {detections[0][0]:.2f}")
                             
                             # Triple beep alarm
-                            self.play_beep()   
+                            # self.play_beep()   
 
+                            self.play_beep_procces()
+
+                            
                             self.turn_on_alarm_leds()
 
                             self.conut_frame_for_detect = 0
