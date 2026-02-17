@@ -143,6 +143,14 @@ class PersonAlarmManager:
             text=True
         )
 
+    def turn_on_manual_leds(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/pixel_leds.py', '3', '0.5'],
+            capture_output=True,
+            text=True
+        )
+
     def turn_on_search_targets_leds(self):
 
         result = subprocess.run(
@@ -271,19 +279,19 @@ class PersonAlarmManager:
 
             self.current_pan, self.current_tilt, self.current_zoom = self.get_current_ptz()
 
-            if command == 'left':
+            if command == 'left' and self.system_state == 'manual':
                 new_pan = self.current_pan + self.pan_step
                 self.abs_pan(new_pan)
-            elif command == 'right':
+            elif command == 'right' and self.system_state == 'manual':
                 new_pan = self.current_pan - self.pan_step
                 self.abs_pan(new_pan)
-            elif command == 'up':
+            elif command == 'up' and self.system_state == 'manual':
                 new_tilt = self.current_tilt + self.tilt_step
                 self.abs_tilt(new_tilt)
-            elif command == 'down':
+            elif command == 'down' and self.system_state == 'manual':
                 new_tilt = self.current_tilt - self.tilt_step
                 self.abs_tilt(new_tilt)
-            elif command == 'go_home':
+            elif command == 'go_home' and self.system_state == 'manual':
                 self.go_home()
             elif command == 'switch_state':
                 self.switch_state()
@@ -418,8 +426,14 @@ class PersonAlarmManager:
     def switch_state(self):
         if self.system_state == 'manual':
             self.system_state = 'auto'
+            self.go_home()
+            self.turn_off_leds()
+
+
+
         elif self.system_state == 'auto':
             self.system_state = 'manual'
+            self.turn_on_manual_leds()
         
         print(f'🔄 System state changed to: {self.system_state}')    
     
@@ -1145,7 +1159,7 @@ class PersonAlarmManager:
                     self.conut_frame_for_detect += 1
    
                 
-            elif self.lidar_target_deg is not None:
+            elif self.lidar_target_deg is not None and self.system_state == 'auto':
                 self.rotating_to_target_active = True
                 self.conut_frame_for_detect = 0
                 self.rotate_to_target(self.lidar_target_deg)

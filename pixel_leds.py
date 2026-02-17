@@ -31,3 +31,7 @@ elif mode == "2":
     for i in range(8):
         pixels.setPixelColor(i, Color(255, 0, 0))  # White (GRB order)
     pixels.show()
+elif mode == "3":
+    for i in range(8):
+        pixels.setPixelColor(i, Color(0, 255, 0))  # White (GRB order)
+    pixels.show()
