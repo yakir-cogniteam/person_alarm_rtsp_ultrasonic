@@ -72,7 +72,7 @@ class ConfigDialog:
             width=20
         )
         self.camera_entry.pack(side='left', padx=(10, 0))
-        self.camera_entry.insert(0, " 192.168.12.140")  # Default value
+        self.camera_entry.insert(0, "10.60.105.140")  # Default value
         
         # PI IP input
         pi_frame = tk.Frame(main_frame, bg='#ecf0f1')
@@ -95,7 +95,7 @@ class ConfigDialog:
             width=20
         )
         self.pi_entry.pack(side='left', padx=(10, 0))
-        self.pi_entry.insert(0, "192.168.12.250")  # Default value
+        self.pi_entry.insert(0, "10.60.105.250")  # Default value
         
         # Confirm button
         confirm_btn = tk.Button(
