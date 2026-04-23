@@ -169,6 +169,14 @@ class PersonAlarmManager:
             text=True
     )
 
+
+    def send_sms_procces(self):
+
+        result = subprocess.run(
+            ['python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/send_sms.py'],
+            capture_output=True,
+            text=True
+    )
     def turn_on_manual_leds(self):
 
         result = subprocess.run(
@@ -1138,6 +1146,8 @@ class PersonAlarmManager:
                             self.turn_on_alarm_leds()
 
                             self.turn_on_light_sensor_procces()
+
+                            # self.send_sms_procces()
 
                             self.conut_frame_for_detect = 0
                             self.rotating_to_target_active = False
