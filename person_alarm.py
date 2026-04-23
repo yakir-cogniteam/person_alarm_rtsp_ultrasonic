@@ -26,6 +26,7 @@ class PersonAlarmManager:
 
 
         self.turn_off_leds()
+        self.turn_off_light_sensor_procces()
 
         self.ws_path = "/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic"
         #self.ws_path = "/home/cogniteam-user/person_alarm_ws/person_alarm_rtsp_ultrasonic/"
@@ -151,6 +152,23 @@ class PersonAlarmManager:
             text=True
         )
 
+
+    def turn_on_light_sensor_procces(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/light_sensor.py','ON'],
+            capture_output=True,
+            text=True
+        )
+
+    def turn_off_light_sensor_procces(self):
+
+        result = subprocess.run(
+            ['sudo', 'python3', '/home/pi/person_alarm_ws/person_alarm_rtsp_ultrasonic/light_sensor.py','OFF'],
+            capture_output=True,
+            text=True
+    )
+
     def turn_on_manual_leds(self):
 
         result = subprocess.run(
@@ -178,6 +196,8 @@ class PersonAlarmManager:
     def disconnect(self):
 
         self.turn_off_leds()
+
+        self.turn_off_light_sensor_procces()
 
         """Clean up and disconnect"""
         print("🛑 Stopping all threads...")
@@ -436,6 +456,7 @@ class PersonAlarmManager:
             self.system_state = 'auto'
             self.go_home()
             self.turn_off_leds()
+            self.turn_off_light_sensor_procces()
 
 
 
@@ -1086,6 +1107,7 @@ class PersonAlarmManager:
                     self.detection_active = False
                     self.go_home()
                     self.turn_off_leds()
+                    self.turn_off_light_sensor_procces()
 
                     
 
@@ -1115,6 +1137,8 @@ class PersonAlarmManager:
                             
                             self.turn_on_alarm_leds()
 
+                            self.turn_on_light_sensor_procces()
+
                             self.conut_frame_for_detect = 0
                             self.rotating_to_target_active = False
                             self.enable_detection = False
@@ -1129,6 +1153,7 @@ class PersonAlarmManager:
                         self.wanted_pan = None
                         self.go_home()
                         self.turn_off_leds()
+                        self.turn_off_light_sensor_procces()
      
 
 
